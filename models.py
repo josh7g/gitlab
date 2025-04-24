@@ -56,29 +56,28 @@ class CloudScan(db.Model):
         }
 
 class GitLabAnalysisResult(db.Model):
-    """Model for storing GitLab repository security scan results"""
+    """Model for storing GitLab repository analysis results"""
     __tablename__ = 'gitlab_analysis_results'
     
     id = db.Column(db.Integer, primary_key=True)
-    repository_name = db.Column(db.String(255), nullable=False)
-    project_id = db.Column(db.String(255), nullable=False)  # GitLab project ID
-    timestamp = db.Column(db.DateTime, default=datetime.utcnow)
-    status = db.Column(db.String(50), default='pending')
+    project_id = db.Column(db.String(255), nullable=False)
+    project_url = db.Column(db.String(500), nullable=False)
+    user_id = db.Column(db.String(255), nullable=False)
+    timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
+    status = db.Column(db.String(50), nullable=False)
     results = db.Column(JSONB)
-    error = db.Column(db.Text)
-    user_id = db.Column(db.String(255))
     rerank = db.Column(JSONB)
-    completed_at = db.Column(db.DateTime)
-    
+    error = db.Column(db.Text)
+
     def to_dict(self):
         return {
             'id': self.id,
-            'repository_name': self.repository_name,
             'project_id': self.project_id,
+            'project_url': self.project_url,
             'user_id': self.user_id,
             'timestamp': self.timestamp.isoformat(),
-            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
             'status': self.status,
             'results': self.results,
+            'rerank': self.rerank,
             'error': self.error
         }

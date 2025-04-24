@@ -1050,7 +1050,6 @@ def trigger_general_repository_scan():
         # Create analysis record
         analysis = GitLabAnalysisResult(
             project_id=project_id,
-            project_url=project_url,
             user_id=user_id,
             status='queued',
             timestamp=datetime.utcnow()

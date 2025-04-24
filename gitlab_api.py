@@ -32,9 +32,46 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def create_api_engine():
-    """Create database engine for API routes"""
-    return create_db_engine(os.getenv('GITLAB_DATABASE_URL', os.getenv('DATABASE_URL')))
+def create_db_engine(database_url=None):
+    try:
+        # If no URL is provided, try to get it from environment
+        if database_url is None:
+            database_url = os.getenv('DATABASE_URL')
+        
+        print(f"Attempting to connect to database URL: {database_url}")
+        
+        # Log parsed components
+        from urllib.parse import urlparse
+        parsed_url = urlparse(database_url)
+        print(f"Hostname: {parsed_url.hostname}")
+        print(f"Port: {parsed_url.port}")
+        print(f"Path: {parsed_url.path}")
+        
+        # Attempt to resolve hostname
+        import socket
+        try:
+            ip_address = socket.gethostbyname(parsed_url.hostname)
+            print(f"Resolved hostname to IP: {ip_address}")
+        except socket.gaierror as e:
+            print(f"DNS resolution failed: {e}")
+            raise
+
+        engine = create_engine(
+            database_url,
+            pool_pre_ping=True,
+            pool_recycle=3600,
+            connect_args={
+                'keepalives': 1,
+                'keepalives_idle': 30,
+                'keepalives_interval': 10,
+                'keepalives_count': 5,
+                'connect_timeout': 10
+            }
+        )
+        return engine
+    except Exception as e:
+        print(f"Database connection error: {str(e)}")
+        raise
 
 # Create Blueprint
 gitlab_bp = Blueprint('gitlab', __name__, url_prefix='/api/v1/gitlab')

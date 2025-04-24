@@ -57,22 +57,22 @@ def add_gitlab_table_columns():
     
     with app.app_context():
         try:
-            # Check for completed_at column
+            # Check for project_url column
             result = db.session.execute(text("""
                 SELECT column_name 
                 FROM information_schema.columns 
-                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'completed_at'
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'project_url'
             """))
-            completed_at_exists = bool(result.scalar())
+            project_url_exists = bool(result.scalar())
             
-            if not completed_at_exists:
-                logger.info("Adding completed_at column to gitlab_analysis_results...")
+            if not project_url_exists:
+                logger.info("Adding project_url column to gitlab_analysis_results...")
                 db.session.execute(text("""
                     ALTER TABLE gitlab_analysis_results
-                    ADD COLUMN IF NOT EXISTS completed_at TIMESTAMP
+                    ADD COLUMN IF NOT EXISTS project_url VARCHAR(500) NOT NULL DEFAULT ''
                 """))
                 db.session.commit()
-                logger.info("Added completed_at column to gitlab_analysis_results")
+                logger.info("Added project_url column to gitlab_analysis_results")
             
             # Check for project_id column
             result = db.session.execute(text("""
@@ -90,7 +90,92 @@ def add_gitlab_table_columns():
                 """))
                 db.session.commit()
                 logger.info("Added project_id column to gitlab_analysis_results")
-                
+            
+            # Check for user_id column
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'user_id'
+            """))
+            user_id_exists = bool(result.scalar())
+            
+            if not user_id_exists:
+                logger.info("Adding user_id column to gitlab_analysis_results...")
+                db.session.execute(text("""
+                    ALTER TABLE gitlab_analysis_results
+                    ADD COLUMN IF NOT EXISTS user_id VARCHAR(255) NOT NULL DEFAULT ''
+                """))
+                db.session.commit()
+                logger.info("Added user_id column to gitlab_analysis_results")
+            
+            # Check for status column
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'status'
+            """))
+            status_exists = bool(result.scalar())
+            
+            if not status_exists:
+                logger.info("Adding status column to gitlab_analysis_results...")
+                db.session.execute(text("""
+                    ALTER TABLE gitlab_analysis_results
+                    ADD COLUMN IF NOT EXISTS status VARCHAR(50) NOT NULL DEFAULT 'pending'
+                """))
+                db.session.commit()
+                logger.info("Added status column to gitlab_analysis_results")
+            
+            # Check for results column
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'results'
+            """))
+            results_exists = bool(result.scalar())
+            
+            if not results_exists:
+                logger.info("Adding results column to gitlab_analysis_results...")
+                db.session.execute(text("""
+                    ALTER TABLE gitlab_analysis_results
+                    ADD COLUMN IF NOT EXISTS results JSONB
+                """))
+                db.session.commit()
+                logger.info("Added results column to gitlab_analysis_results")
+            
+            # Check for rerank column
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'rerank'
+            """))
+            rerank_exists = bool(result.scalar())
+            
+            if not rerank_exists:
+                logger.info("Adding rerank column to gitlab_analysis_results...")
+                db.session.execute(text("""
+                    ALTER TABLE gitlab_analysis_results
+                    ADD COLUMN IF NOT EXISTS rerank JSONB
+                """))
+                db.session.commit()
+                logger.info("Added rerank column to gitlab_analysis_results")
+            
+            # Check for error column
+            result = db.session.execute(text("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'error'
+            """))
+            error_exists = bool(result.scalar())
+            
+            if not error_exists:
+                logger.info("Adding error column to gitlab_analysis_results...")
+                db.session.execute(text("""
+                    ALTER TABLE gitlab_analysis_results
+                    ADD COLUMN IF NOT EXISTS error TEXT
+                """))
+                db.session.commit()
+                logger.info("Added error column to gitlab_analysis_results")
+            
             # Add an index on project_id and user_id for faster queries
             db.session.execute(text("""
                 CREATE INDEX IF NOT EXISTS ix_gitlab_analysis_results_project_id
@@ -109,7 +194,6 @@ def add_gitlab_table_columns():
             logger.error(f"Error adding columns to GitLab analysis results table: {str(e)}")
             db.session.rollback()
             raise
-
 # Modify the init_tables function to include the GitLab table
 def init_tables():
     """Initialize tables if they don't exist and add necessary columns"""

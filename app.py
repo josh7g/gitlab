@@ -1,3 +1,5 @@
+from gevent import monkey
+monkey.patch_all()
 
 from flask import Flask, request, jsonify , redirect
 import os
@@ -187,7 +189,7 @@ socketio = SocketIO(
     ],
     message_queue=REDIS_URL,
     channel="semgrep-scan",
-    async_mode='asgi',
+    async_mode='gevent',
     ping_timeout=60,
     ping_interval=25,
     max_http_buffer_size=5 * 1024 * 1024,

@@ -1,4 +1,4 @@
-# gitlab_scanner.py - Enhanced version with language detection and multiple scan configurations
+
 import os
 import subprocess
 import logging
@@ -843,3 +843,283 @@ class GitLabSecurityScanner:
                     'timestamp': datetime.now().isoformat()
                 }
             }
+        
+
+def format_file_size(size_bytes: int) -> str:
+    """Convert bytes to human readable format"""
+    for unit in ['B', 'KB', 'MB', 'GB']:
+        if size_bytes < 1024:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024
+    return f"{size_bytes:.2f} TB"
+
+def validate_gitlab_url(url: str) -> bool:
+    """Validate GitLab repository URL format"""
+    if not url:
+        return False
+    
+    valid_formats = [
+        r'https://gitlab\.com/[\w-]+/[\w-]+(?:\.git)?$',
+        r'git@gitlab\.com:[\w-]+/[\w-]+(?:\.git)?$'
+    ]
+    
+    return any(re.match(pattern, url) for pattern in valid_formats)
+
+def get_severity_weight(severity: str) -> int:
+    """Get numerical weight for severity level for sorting"""
+    weights = {
+        'CRITICAL': 5,
+        'HIGH': 4,
+        'MEDIUM': 3,
+        'LOW': 2,
+        'INFO': 1
+    }
+    return weights.get(severity.upper(), 0)
+
+def sort_findings_by_severity(findings: List[Dict]) -> List[Dict]:
+    """Sort findings by severity level"""
+    return sorted(
+        findings,
+        key=lambda x: get_severity_weight(x.get('severity', 'INFO')),
+        reverse=True
+    )
+
+def deduplicate_findings(scan_results: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove duplicate findings from scan results based on multiple criteria"""
+    if not scan_results.get('success') or 'data' not in scan_results:
+        return scan_results
+
+    original_summary = scan_results['data'].get('summary', {})
+    findings = scan_results['data'].get('findings', [])
+    
+    if not findings:
+        return scan_results
+    
+    seen_findings = set()
+    deduplicated_findings = []
+    
+    for finding in findings:
+        finding_signature = (
+            finding.get('file', ''),
+            finding.get('line_start', 0),
+            finding.get('line_end', 0),
+            finding.get('category', ''),
+            finding.get('severity', ''),
+            finding.get('code_snippet', '')
+        )
+        
+        if finding_signature not in seen_findings:
+            seen_findings.add(finding_signature)
+            deduplicated_findings.append(finding)
+    
+    severity_counts = defaultdict(int)
+    category_counts = defaultdict(int)
+    
+    for finding in deduplicated_findings:
+        severity = finding.get('severity', 'UNKNOWN')
+        category = finding.get('category', 'unknown')
+        severity_counts[severity] += 1
+        category_counts[category] += 1
+    
+    updated_summary = {
+        'total_findings': len(deduplicated_findings),
+        'files_scanned': original_summary.get('files_scanned', 0),
+        'files_with_findings': original_summary.get('files_with_findings', 0),
+        'skipped_files': original_summary.get('skipped_files', 0),
+        'partially_scanned': original_summary.get('partially_scanned', 0),
+        'severity_counts': dict(severity_counts),
+        'category_counts': dict(category_counts),
+        'deduplication_info': {
+            'original_count': len(findings),
+            'deduplicated_count': len(deduplicated_findings),
+            'duplicates_removed': len(findings) - len(deduplicated_findings)
+        }
+    }
+    
+    scan_results['data']['findings'] = deduplicated_findings
+    scan_results['data']['summary'] = updated_summary
+    
+    return scan_results
+
+async def scan_gitlab_repository_handler(
+    project_url: str,
+    access_token: str,
+    user_id: str,
+    db_session: Optional[Session] = None,
+    analysis_record: Optional[GitLabAnalysisResult] = None
+) -> Dict:
+    """Handler function for GitLab web routes with input validation"""
+    logger.info(f"Starting scan request for GitLab project: {project_url}")
+    
+    if not all([project_url, access_token, user_id]):
+        return {
+            'success': False,
+            'error': {
+                'message': 'Missing required parameters',
+                'code': 'INVALID_PARAMETERS'
+            }
+        }
+
+    if not validate_gitlab_url(project_url):
+        return {
+            'success': False,
+            'error': {
+                'message': 'Invalid project URL format',
+                'code': 'INVALID_PROJECT_URL',
+                'details': 'Only GitLab.com repositories are supported'
+            }
+        }
+
+    try:
+        # Extract repository name for progress tracking
+        repo_name = project_url.split('/')[-1].replace('.git', '')
+        
+        # Clear previous progress
+        from progress_tracking import clear_scan_progress
+        clear_scan_progress(user_id, repo_name)
+        
+        # Initialize scanner with config and record ID
+        config = GitLabScanConfig()
+        analysis_id = analysis_record.id if analysis_record else None
+        
+        async with GitLabSecurityScanner(config, db_session, analysis_id) as scanner:
+            try:
+                # Get project ID and check size (update with progress)
+                update_scan_progress(user_id, repo_name, 'validating', 10)
+                
+                # Extract project ID (numeric)
+                project_id = scanner._extract_project_id(project_url, access_token)
+                
+                # Update project_id in database if possible
+                if analysis_record and db_session:
+                    try:
+                        analysis_record.project_id = str(project_id)
+                        db_session.commit()
+                    except Exception as e:
+                        logger.error(f"Failed to update project ID: {str(e)}")
+                        db_session.rollback()
+                
+                # Check repository size
+                size_info = await scanner._check_repository_size(project_id, access_token)
+                
+                if not size_info['is_compatible']:
+                    # Update progress to error
+                    update_scan_progress(user_id, repo_name, 'error', 0)
+                    
+                    # Update analysis record
+                    if analysis_record and db_session:
+                        try:
+                            analysis_record.status = 'error'
+                            analysis_record.error = f"Repository too large: {size_info['size_mb']}MB"
+                            analysis_record.completed_at = datetime.now()
+                            db_session.commit()
+                        except Exception:
+                            db_session.rollback()
+                    
+                    return {
+                        'success': False,
+                        'error': {
+                            'message': 'Repository too large for analysis',
+                            'code': 'REPOSITORY_TOO_LARGE',
+                            'details': {
+                                'size_mb': size_info['size_mb'],
+                                'limit_mb': config.max_total_size_mb,
+                                'recommendation': 'Consider analyzing specific directories or branches'
+                            }
+                        }
+                    }
+                
+                # Run the scan with progress tracking
+                results = await scanner.scan_repository(
+                    project_url,
+                    access_token,
+                    user_id
+                )
+                
+                # Enrich results with repository info
+                if results.get('success'):
+                    results['data']['repository_info'] = {
+                        'size_mb': size_info['size_mb'],
+                        'primary_language': size_info['language'],
+                        'default_branch': size_info['default_branch']
+                    }
+                
+                # Deduplicate findings before returning
+                return deduplicate_findings(results)
+
+            except ValueError as ve:
+                # Update progress to error
+                update_scan_progress(user_id, repo_name, 'error', 0)
+                
+                # Update analysis record
+                if analysis_record and db_session:
+                    try:
+                        analysis_record.status = 'error'
+                        analysis_record.error = str(ve)
+                        analysis_record.completed_at = datetime.now()
+                        db_session.commit()
+                    except Exception:
+                        db_session.rollback()
+                
+                return {
+                    'success': False,
+                    'error': {
+                        'message': str(ve),
+                        'code': 'VALIDATION_ERROR',
+                        'timestamp': datetime.now().isoformat()
+                    }
+                }
+            
+            except git.GitCommandError as ge:
+                # Update progress to error
+                update_scan_progress(user_id, repo_name, 'error', 0)
+                
+                # Update analysis record
+                if analysis_record and db_session:
+                    try:
+                        analysis_record.status = 'error'
+                        analysis_record.error = f"Git error: {str(ge)}"
+                        analysis_record.completed_at = datetime.now()
+                        db_session.commit()
+                    except Exception:
+                        db_session.rollback()
+                
+                return {
+                    'success': False,
+                    'error': {
+                        'message': 'Git operation failed',
+                        'code': 'GIT_ERROR',
+                        'details': str(ge),
+                        'timestamp': datetime.now().isoformat()
+                    }
+                }
+
+    except Exception as e:
+        # Update progress to error if possible
+        try:
+            repo_name = project_url.split('/')[-1].replace('.git', '')
+            update_scan_progress(user_id, repo_name, 'error', 0)
+        except:
+            pass
+        
+        # Update analysis record
+        if analysis_record and db_session:
+            try:
+                analysis_record.status = 'error'
+                analysis_record.error = str(e)
+                analysis_record.completed_at = datetime.now()
+                db_session.commit()
+            except Exception:
+                db_session.rollback()
+        
+        logger.error(f"Handler error: {str(e)}")
+        return {
+            'success': False,
+            'error': {
+                'message': 'Unexpected error in scan handler',
+                'code': 'INTERNAL_ERROR',
+                'details': str(e),
+                'type': type(e).__name__,
+                'timestamp': datetime.now().isoformat()
+            }
+        }

@@ -25,6 +25,7 @@ from gitlab_scanner import (
     GitLabScanConfig, 
     GitLabSecurityScanner
 )
+from typing import Dict, List, Optional, Union, Any, Tuple
 
 logging.basicConfig(
     level=logging.INFO,
@@ -350,8 +351,53 @@ def trigger_specific_repository_scan(repo_id):
             db_session.close()
             logger.info("Database session closed")
 
+def handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session):
+    """Helper function to handle reranking failures by falling back to original order"""
+    logger.info("Falling back to original findings order due to reranking failure")
+    
+    # Calculate basic stats from findings
+    severity_counts = defaultdict(int)
+    category_counts = defaultdict(int)
+    for finding in findings:
+        severity = finding.get('severity', 'INFO')
+        category = finding.get('category', 'unknown')
+        severity_counts[severity] += 1
+        category_counts[category] += 1
+    
+    summary = {
+        'total_findings': len(findings),
+        'severity_counts': dict(severity_counts),
+        'category_counts': dict(category_counts),
+        'files_scanned': len(set(f.get('file', '') for f in findings)),
+        'files_with_findings': len(set(f.get('file', '') for f in findings))
+    }
+    
+    # Store in database
+    results_data = {
+        'findings': findings,
+        'summary': summary,
+        'metadata': {
+            'scan_duration_seconds': 0,
+            'timestamp': datetime.utcnow().isoformat(),
+            'project_id': project_id,
+            'project_url': project_url,
+            'user_id': user_id,
+            'reranking': 'failed_used_original'
+        }
+    }
+    
+    try:
+        analysis.status = 'completed'
+        analysis.results = results_data
+        analysis.rerank = findings
+        db_session.commit()
+        logger.info(f"Successfully stored original findings (after reranking failure) and updated analysis {analysis.id}")
+    except Exception as e:
+        logger.error(f"Database error when handling reranking failure: {str(e)}")
+        db_session.rollback()
+
 def rerank_findings(findings, user_id, project_url, project_id, analysis, db_session):
-    """Helper function to rerank findings through AI"""
+    """Helper function to rerank findings through AI with improved logging and fallback"""
     try:
         if not findings:
             logger.info("No findings to rerank")
@@ -381,38 +427,103 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
             }
         }
         
+        # Log the data being sent to LLM
+        logger.info(f"Data being sent to LLM reranking service:")
+        logger.info(f"Number of findings: {len(llm_data['findings'])}")
+        logger.info(f"Metadata: {json.dumps(llm_data['metadata'])}")
+        logger.info(f"Sample findings (first 2): {json.dumps(llm_data['findings'][:2] if len(llm_data['findings']) >= 2 else llm_data['findings'])}")
+        
         # Call LLM reranking service
         AI_RERANK_URL = os.getenv('RERANK_API_URL')
         if not AI_RERANK_URL:
-            logger.error("RERANK_API_URL not configured, skipping reranking")
+            logger.error("RERANK_API_URL not configured, skipping reranking and using original order")
+            # Create finding dictionary by ID - using original order
+            reordered_findings = findings
+            
+            # Prepare results structure with stats
+            severity_counts = defaultdict(int)
+            category_counts = defaultdict(int)
+            for finding in findings:
+                severity = finding.get('severity', 'INFO')
+                category = finding.get('category', 'unknown')
+                severity_counts[severity] += 1
+                category_counts[category] += 1
+            
+            summary = {
+                'total_findings': len(findings),
+                'severity_counts': dict(severity_counts),
+                'category_counts': dict(category_counts),
+                'files_scanned': len(set(f.get('file', '') for f in findings)),
+                'files_with_findings': len(set(f.get('file', '') for f in findings))
+            }
+            
+            # Store in database
+            results_data = {
+                'findings': findings,
+                'summary': summary,
+                'metadata': {
+                    'scan_duration_seconds': 0,  # We don't have this info here
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'project_id': project_id,
+                    'project_url': project_url,
+                    'user_id': user_id,
+                    'reranking': 'skipped_no_url'
+                }
+            }
+            
             analysis.status = 'completed'
-            analysis.results = {'findings': findings, 'summary': {}, 'metadata': {}}
-            analysis.rerank = findings
+            analysis.results = results_data
+            analysis.rerank = reordered_findings
             db_session.commit()
+            logger.info(f"Successfully stored original findings (no reranking) and updated analysis {analysis.id}")
             return
             
         try:
             # Synchronous call for simplicity in this thread
             headers = {'Content-Type': 'application/json'}
+            logger.info(f"Calling reranking service at: {AI_RERANK_URL}")
+            
             response = requests.post(
                 AI_RERANK_URL, 
                 headers=headers,
-                json=llm_data
+                json=llm_data,
+                timeout=60  # Add timeout to prevent hanging
             )
             
+            # Log the complete response
+            logger.info(f"Reranking service response status: {response.status_code}")
+            logger.info(f"Reranking service response headers: {response.headers}")
+            
+            response_text = response.text
+            logger.info(f"Reranking service raw response: {response_text}")
+            
             if response.status_code == 200:
-                response_data = response.json()
-                reranked_ids = extract_ids_from_llm_response(response_data)
-                
-                if reranked_ids:
+                try:
+                    response_data = response.json()
+                    logger.info(f"Parsed JSON response: {json.dumps(response_data)}")
+                    
+                    reranked_ids = extract_ids_from_llm_response(response_data, findings)
+                    
+                    # Always ensure we have valid IDs, falling back to original order if needed
+                    if not reranked_ids or len(reranked_ids) == 0:
+                        logger.warning("No valid IDs returned from reranking service, using original order")
+                        reranked_ids = list(range(1, len(findings) + 1))
+                    
                     # Create finding dictionary by ID
                     findings_map = {finding['ID']: finding for finding in findings}
                     
                     # Create reordered list
-                    reordered_findings = [
-                        findings_map[rank_id] for rank_id in reranked_ids 
-                        if rank_id in findings_map
-                    ]
+                    reordered_findings = []
+                    for rank_id in reranked_ids:
+                        if rank_id in findings_map:
+                            reordered_findings.append(findings_map[rank_id])
+                        else:
+                            logger.warning(f"ID {rank_id} from reranking not found in findings")
+                    
+                    # If somehow we ended up with no findings after reranking, use original order
+                    if not reordered_findings:
+                        logger.warning("Reranking resulted in empty findings list, using original order")
+                        reordered_findings = findings
                     
                     # Prepare results structure with stats
                     severity_counts = defaultdict(int)
@@ -450,62 +561,84 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
                     analysis.rerank = reordered_findings
                     db_session.commit()
                     logger.info(f"Successfully reranked findings and updated analysis {analysis.id}")
-                else:
-                    logger.warning("Reranking failed: No valid IDs returned")
-                    analysis.status = 'completed'
-                    analysis.results = {'findings': findings, 'summary': {}, 'metadata': {}}
-                    analysis.rerank = findings
-                    db_session.commit()
+                except json.JSONDecodeError as je:
+                    logger.error(f"Failed to parse reranking JSON response: {str(je)}")
+                    # Fall back to original order
+                    handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
             else:
-                logger.error(f"LLM reranking failed: {response.status_code} - {response.text}")
-                analysis.status = 'completed'
-                analysis.results = {'findings': findings, 'summary': {}, 'metadata': {}}
-                analysis.rerank = findings
-                db_session.commit()
+                logger.error(f"LLM reranking failed: {response.status_code} - {response_text}")
+                # Fall back to original order
+                handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
                 
         except Exception as e:
             logger.error(f"Error calling LLM service: {str(e)}")
-            analysis.status = 'completed'
-            analysis.results = {'findings': findings, 'summary': {}, 'metadata': {}}
-            analysis.rerank = findings
-            db_session.commit()
+            logger.error(traceback.format_exc())
+            # Fall back to original order
+            handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
     
     except Exception as e:
         logger.error(f"Error in rerank_findings: {str(e)}")
         logger.error(traceback.format_exc())
         try:
-            analysis.status = 'completed'
-            analysis.results = {'findings': findings, 'summary': {}, 'metadata': {}}
-            analysis.rerank = findings
-            db_session.commit()
+            # Fall back to original order
+            handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
         except:
             db_session.rollback()
+            logger.error("Critical failure in reranking fallback handler")
 
-def extract_ids_from_llm_response(response_data):
-    """Extract IDs from LLM response text"""
+
+def extract_ids_from_llm_response(response_data: Union[Dict, List, str], original_findings: List[Dict] = None) -> Optional[List[int]]:
+    """
+    Extract IDs from LLM response text with improved logging and fallback.
+    
+    Args:
+        response_data: Response from reranking API
+        original_findings: Original list of findings (for reference)
+        
+    Returns:
+        Optional[List[int]]: List of reranked IDs or None if extraction fails
+    """
     try:
-        logger.info("Extracting IDs from LLM response")
-        if isinstance(response_data, dict) and 'llm_response' in response_data:
-            # If llm_response is already a list, use it directly
-            if isinstance(response_data['llm_response'], list):
-                logger.info(f"Found ID list: {response_data['llm_response']}")
-                return response_data['llm_response']
-            
-            # If it's a string (the old format), try to parse it
-            response_text = response_data['llm_response']
-            if isinstance(response_text, str):
-                import re
-                array_match = re.search(r'\[([\d,\s]+)\]', response_text)
+        logger.info(f"Processing reranking response: {json.dumps(response_data, indent=2)}")
+        
+        # Handle dictionary response
+        if isinstance(response_data, dict):
+            # Check for llm_response field
+            if 'llm_response' in response_data:
+                response = response_data['llm_response']
+                logger.info(f"LLM Response content: {response}")
+                
+                if not response or response == '[]':
+                    logger.warning("Empty llm_response, falling back to original order")
+                    return list(range(1, len(original_findings) + 1)) if original_findings else None
+                    
+                if isinstance(response, list):
+                    if len(response) > 0:
+                        logger.info(f"Found ID list: {response}")
+                        return response
+                    else:
+                        logger.warning("Empty list in response, falling back to original order")
+                        return list(range(1, len(original_findings) + 1)) if original_findings else None
+                    
+                array_match = re.search(r'\[([\d,\s]+)\]', str(response))
                 if array_match:
                     id_string = array_match.group(1)
                     return [int(id.strip()) for id in id_string.split(',')]
-                    
-        logger.warning("Could not find valid ID list in response")
-        return None
+        
+        # Handle list response
+        elif isinstance(response_data, list):
+            if not response_data:
+                logger.warning("Empty list response, falling back to original order")
+                return list(range(1, len(original_findings) + 1)) if original_findings else None
+            return response_data
+        
+        logger.warning("Could not extract IDs from response, falling back to original order")
+        return list(range(1, len(original_findings) + 1)) if original_findings else None
+        
     except Exception as e:
         logger.error(f"Error extracting IDs from LLM response: {str(e)}")
-        logger.error(f"Response data type: {type(response_data)}")
-        return None
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        return list(range(1, len(original_findings) + 1)) if original_findings else None
 
 @gitlab_bp.route('/repositories', methods=['GET'])
 def list_repositories():

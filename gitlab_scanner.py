@@ -1,4 +1,4 @@
-#gitlab_scanner.py
+# gitlab_scanner.py - Enhanced version with language detection and multiple scan configurations
 import os
 import subprocess
 import logging
@@ -13,7 +13,8 @@ import ssl
 import traceback
 import fnmatch
 import requests
-from typing import Dict, List, Optional, Union, Any 
+import time
+from typing import Dict, List, Optional, Union, Any, Tuple
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -32,28 +33,119 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class GitLabScanConfig:
-    """Configuration for GitLab repository scanning"""
-    max_file_size_mb: int = 25
-    max_total_size_mb: int = 300
-    max_memory_mb: int = 1500
-    chunk_size_mb: int = 30
-    max_files_per_chunk: int = 50
+    """Configuration for GitLab repository scanning with language-specific rules"""
+    # File size limits
+    max_file_size_mb: int = 50
+    max_total_size_mb: int = 600
+    max_memory_mb: int = 3000
+    chunk_size_mb: int = 60
+    max_files_per_chunk: int = 100
     
-    timeout_seconds: int = 540
+    # Timeout configuration based on ruleset size
+    timeout_map: Dict[str, int] = field(default_factory=lambda: {
+        "ci": 1200,          
+        "security-audit": 540,  
+        "owasp-top-ten": 600,  
+        "supply-chain": 300,   
+        "insecure-transport": 300,
+        "jwt": 300,
+        "secrets": 300,
+        "xss": 300,
+        "sql-injection": 300,
+        "javascript": 300,
+        "python": 300,
+        "java": 300,
+        "php": 300,
+        "csharp": 300,
+        "csharp-security": 300,
+        "csharp-webconfig": 180,
+        "csharp-cors": 180,
+        "csharp-jwt": 180,
+        "csharp-csrf": 180,
+        "csharp-auth": 240,
+        "csharp-sqlinjection": 240,
+        "csharp-xss": 180,
+        "dotnet": 300
+    })
+    default_timeout: int = 600  # 10 minutes default
     chunk_timeout: int = 120
     file_timeout_seconds: int = 20
     max_retries: int = 2
-    concurrent_processes: int = 1
+    concurrent_processes: int = 2
 
+    # File exclusion patterns
     exclude_patterns: List[str] = field(default_factory=lambda: [
-        '.git', '.svn', 'node_modules', 'vendor',
-        'bower_components', 'packages', 'dist',
-        'build', 'out', 'venv', '.env', '__pycache__',
-        '*.min.*', '*.bundle.*', '*.map', 
-        '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov}',
-        'package-lock.json', 'yarn.lock',
-        'coverage', 'test*', 'docs'
+        '.git',
+        'node_modules',
+        'vendor',
+        '*.min.*',
+        '*.bundle.*',
+        '*.map',
+        '*.{pdf,jpg,jpeg,png,gif,zip,tar,gz,rar,mp4,mov}'
     ])
+
+    # Scan configurations with rule counts - organized by type
+    core_configs: List[Dict] = field(default_factory=lambda: [
+        {"name": "security-audit", "config": "p/security-audit", "rules_count": 225},
+        {"name": "owasp-top-ten", "config": "p/owasp-top-ten", "rules_count": 300},
+        {"name": "secrets", "config": "p/secrets", "rules_count": 50},
+        {"name": "supply-chain", "config": "p/supply-chain", "rules_count": 200},
+    ])
+
+    web_configs: List[Dict] = field(default_factory=lambda: [
+        {"name": "insecure-transport", "config": "p/insecure-transport", "rules_count": 100},
+        {"name": "jwt", "config": "p/jwt", "rules_count": 50},
+        {"name": "xss", "config": "p/xss", "rules_count": 100},
+        {"name": "sql-injection", "config": "p/sql-injection", "rules_count": 75},
+        {"name": "command-injection", "config": "p/command-injection", "rules_count": 75},
+        {"name": "trailofbits", "config": "p/trailofbits", "rules_count": 100},  
+    ])
+
+    language_configs: Dict[str, List[Dict]] = field(default_factory=lambda: {
+        "python": [
+            {"name": "python", "config": "p/python", "rules_count": 100},
+            {"name": "django", "config": "p/django", "rules_count": 75},
+            {"name": "flask", "config": "p/flask", "rules_count": 50},
+            {"name": "fastapi", "config": "p/fastapi", "rules_count": 40},
+        ],
+        "javascript": [
+            {"name": "javascript", "config": "p/javascript", "rules_count": 100},
+            {"name": "nodejs", "config": "p/nodejs", "rules_count": 100},
+            {"name": "react", "config": "p/react", "rules_count": 100},
+        ],
+        "typescript": [
+            {"name": "typescript", "config": "p/typescript", "rules_count": 100},
+            {"name": "nodejs", "config": "p/nodejs", "rules_count": 100},
+            {"name": "react", "config": "p/react", "rules_count": 100},
+        ],
+        "java": [
+            {"name": "java", "config": "p/java", "rules_count": 100},
+            {"name": "spring", "config": "p/spring", "rules_count": 100},
+        ],
+        "php": [
+            {"name": "php", "config": "p/php", "rules_count": 100},
+        ],
+        "c#": [
+            {"name": "csharp", "config": "r/csharp", "rules_count": 150},
+            {"name": "csharp-security", "config": "r/csharp.security", "rules_count": 200},
+            {"name": "csharp-webconfig", "config": "r/csharp.webconfig", "rules_count": 50},
+            {"name": "csharp-cors", "config": "r/csharp.security.cors", "rules_count": 25},
+            {"name": "csharp-jwt", "config": "r/csharp.security.jwt", "rules_count": 30},
+            {"name": "csharp-csrf", "config": "r/csharp.security.csrf", "rules_count": 25},
+            {"name": "csharp-auth", "config": "r/csharp.security.auth", "rules_count": 75},
+            {"name": "csharp-sqlinjection", "config": "r/csharp.security.injection.sql", "rules_count": 50},
+            {"name": "csharp-xss", "config": "r/csharp.security.xss", "rules_count": 40},
+            {"name": "dotnet", "config": "r/dotnet", "rules_count": 175},
+        ],
+        "go": [
+            {"name": "go", "config": "p/golang", "rules_count": 100},
+        ],
+        "ruby": [
+            {"name": "ruby", "config": "p/ruby", "rules_count": 75},
+            {"name": "rails", "config": "p/rails", "rules_count": 75},
+        ]
+    })
+
 class GitLabSecurityScanner:
     def __init__(self, config: GitLabScanConfig = GitLabScanConfig(), db_session: Optional[Session] = None, analysis_id: Optional[int] = None):
         self.config = config
@@ -62,6 +154,9 @@ class GitLabSecurityScanner:
         self.temp_dir = None
         self.repo_dir = None
         self._session = None
+        self.detected_language = None
+        self._project_url = None
+        self._user_id = None
         self.scan_stats = {
             'start_time': None,
             'end_time': None,
@@ -71,18 +166,26 @@ class GitLabSecurityScanner:
             'files_too_large': 0,
             'total_size_mb': 0,
             'memory_usage_mb': 0,
-            'findings_count': 0
+            'findings_count': 0,
+            'scan_durations': {}
         }
 
+    def set_scan_info(self, project_url: str, user_id: str):
+        """Store project URL and user ID for use in progress tracking"""
+        self._project_url = project_url
+        self._user_id = user_id
+
     async def __aenter__(self):
+        """Initialize scanner resources"""
         await self._setup()
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Cleanup scanner resources"""
         await self._cleanup()
 
     async def _setup(self):
-        """Initialize scanner resources"""
+        """Initialize scanner with enhanced error handling"""
         try:
             self.temp_dir = Path(tempfile.mkdtemp(prefix='gitlab_scanner_'))
             logger.info(f"Created temporary directory: {self.temp_dir}")
@@ -98,17 +201,16 @@ class GitLabSecurityScanner:
             )
             
             self.scan_stats['start_time'] = datetime.now()
-            logger.info("Scanner setup completed successfully")
+            logger.info("Scanner initialization completed")
             
         except Exception as e:
-            logger.error(f"Error in scanner setup: {str(e)}")
-            logger.error(f"Exception traceback: {traceback.format_exc()}")
+            logger.error(f"Scanner initialization failed: {str(e)}")
             if self.temp_dir and self.temp_dir.exists():
                 shutil.rmtree(self.temp_dir)
             raise
 
     async def _cleanup(self):
-        """Cleanup scanner resources"""
+        """Cleanup scanner resources with proper error handling"""
         try:
             if self._session and not self._session.closed:
                 await self._session.close()
@@ -121,10 +223,43 @@ class GitLabSecurityScanner:
             self.scan_stats['end_time'] = datetime.now()
             
         except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
+            logger.error(f"Cleanup error: {str(e)}")
+            
+    def get_language_specific_configs(self, language: str) -> List[Dict]:
+        """Get relevant scan configs based on repository language."""
+        configs = []
+        
+        # Always include core security configs
+        configs.extend(self.config.core_configs)
+        logger.info("Added core security configs")
+        
+        # Always include web security configs
+        configs.extend(self.config.web_configs)
+        logger.info("Added web security configs")
+        
+        if not language:
+            logger.warning("No language detected, using core and web security configs only")
+            return configs
+
+        # Normalize language name
+        language = language.lower()
+        
+        # Handle C# variations
+        if language in ["csharp", "cs", "dotnet", "net", "c#"]:
+            language = "c#"
+
+        # Add language-specific configs if available
+        if language in self.config.language_configs:
+            configs.extend(self.config.language_configs[language])
+            logger.info(f"Added {language}-specific configs")
+        else:
+            logger.warning(f"No specific configs available for language: {language}")
+
+        logger.info(f"Total configs to run: {len(configs)} ({[c['name'] for c in configs]})")
+        return configs
 
     async def _check_repository_size(self, project_id: int, access_token: str) -> Dict:
-        """Pre-check repository size using GitLab API"""
+        """Check repository size and detect primary language using GitLab API"""
         if not self._session:
             logger.error("HTTP session not initialized")
             raise RuntimeError("Scanner session not initialized")
@@ -133,7 +268,7 @@ class GitLabSecurityScanner:
             if not access_token:
                 raise ValueError("GitLab token is empty or invalid")
                 
-            logger.info(f"Checking size for project ID: {project_id}")
+            logger.info(f"Checking size and language for project ID: {project_id}")
             
             headers = {
                 'Authorization': f'Bearer {access_token}',
@@ -150,18 +285,47 @@ class GitLabSecurityScanner:
                     raise ValueError(f"GitLab API error: {response_text}")
                 
                 data = json.loads(response_text)
+                
+                # Get repository size
                 size_kb = data.get('statistics', {}).get('repository_size', 0)
-                size_mb = size_kb / 1024 / 1024
+                size_mb = size_kb / 1024
+                
+                # Get primary language - different field in GitLab API
+                self.detected_language = data.get('predominant_language')
                 
                 logger.info(f"Repository size: {size_mb:.2f}MB")
-                logger.info(f"Language: {data.get('predominant_language', 'unknown')}")
+                logger.info(f"Detected language: {self.detected_language}")
                 logger.info(f"Default branch: {data.get('default_branch', 'main')}")
+                
+                # For better language detection, also check languages in repository
+                languages_url = f"https://gitlab.com/api/v4/projects/{project_id}/languages"
+                
+                try:
+                    async with self._session.get(languages_url, headers=headers) as lang_response:
+                        if lang_response.status == 200:
+                            languages_data = await lang_response.json()
+                            if languages_data:
+                                # Languages are returned with percentage values
+                                # Get the one with highest percentage
+                                primary_language = max(languages_data.items(), key=lambda x: x[1])[0]
+                                logger.info(f"Primary language from languages API: {primary_language}")
+                                
+                                # If languages API returned a value, prefer it over predominant_language
+                                if primary_language and not self.detected_language:
+                                    self.detected_language = primary_language
+                except Exception as lang_error:
+                    logger.warning(f"Error getting languages data: {str(lang_error)}")
                 
                 return {
                     'size_mb': size_mb,
                     'is_compatible': size_mb <= self.config.max_total_size_mb,
-                    'language': data.get('predominant_language'),
-                    'default_branch': data.get('default_branch', 'main')
+                    'language': self.detected_language,
+                    'default_branch': data.get('default_branch', 'main'),
+                    'visibility': data.get('visibility', 'unknown'),
+                    'star_count': data.get('star_count', 0),
+                    'fork_count': data.get('forks_count', 0),
+                    'created_at': data.get('created_at'),
+                    'last_activity_at': data.get('last_activity_at')
                 }
                     
         except Exception as e:
@@ -171,7 +335,7 @@ class GitLabSecurityScanner:
     async def _clone_repository(self, project_url: str, access_token: str) -> Path:
         """Clone repository with size validation and optimizations"""
         try:
-            project_id = self._extract_project_id(project_url, access_token)  # Pass access_token here
+            project_id = self._extract_project_id(project_url, access_token)
             size_info = await self._check_repository_size(project_id, access_token)
             
             if not size_info['is_compatible']:
@@ -185,6 +349,7 @@ class GitLabSecurityScanner:
             
             logger.info(f"Cloning repository to {self.repo_dir}")
             
+            # Optimize clone operation
             git_options = [
                 '--depth=1',
                 '--single-branch',
@@ -206,30 +371,35 @@ class GitLabSecurityScanner:
                 shutil.rmtree(self.repo_dir)
             raise RuntimeError(f"Repository clone failed: {str(e)}") from e
 
-    async def _run_semgrep_scan(self, target_dir: Path) -> Dict:
-        """Execute memory-conscious semgrep scan"""
+    async def _run_semgrep_scan(self, target_dir: Path, scan_config: Dict) -> Dict:
+        """Execute semgrep scan with enhanced error handling and monitoring"""
+        semgrepignore_path = target_dir / '.semgrepignore'
+        start_time = time.time()
+        scan_name = scan_config['name']
+        
         try:
-            semgrepignore_path = target_dir / '.semgrepignore'
+            # Create .semgrepignore file
             with open(semgrepignore_path, 'w') as f:
                 for pattern in self.config.exclude_patterns:
                     f.write(f"{pattern}\n")
 
+            timeout = self.config.timeout_map.get(scan_name, self.config.default_timeout)
+            logger.info(f"Starting {scan_name} scan with {timeout}s timeout")
+
             cmd = [
                 "semgrep",
                 "scan",
-                "--config", "p/security-audit",
+                "--config", scan_config["config"],
                 "--json",
                 "--verbose",
                 "--metrics=on",
-                f"--max-memory={self.config.max_memory_mb}",
-                f"--jobs={self.config.concurrent_processes}",
-                f"--timeout={self.config.file_timeout_seconds}",
-                f"--timeout-threshold={self.config.max_retries}",
                 "--no-git-ignore",
-                "--skip-unknown-extensions",
                 "--optimizations=all",
                 str(target_dir)
             ]
+
+            memory_before = psutil.Process().memory_info().rss / (1024 * 1024)
+            logger.info(f"Memory usage before {scan_name}: {memory_before:.2f}MB")
 
             process = await asyncio.create_subprocess_exec(
                 *cmd,
@@ -241,42 +411,161 @@ class GitLabSecurityScanner:
             try:
                 stdout, stderr = await asyncio.wait_for(
                     process.communicate(),
-                    timeout=self.config.timeout_seconds
+                    timeout=timeout
                 )
             except asyncio.TimeoutError:
                 process.kill()
-                logger.error(f"Scan timed out after {self.config.timeout_seconds}s")
-                return self._create_empty_result(error="Scan timed out")
+                elapsed_time = time.time() - start_time
+                error_msg = f"Scan {scan_name} timed out after {elapsed_time:.2f}s"
+                logger.error(error_msg)
+                return self._create_empty_result(error=error_msg)
 
-            self.scan_stats['memory_usage_mb'] = psutil.Process().memory_info().rss / (1024 * 1024)
-            
+            memory_after = psutil.Process().memory_info().rss / (1024 * 1024)
+            memory_diff = memory_after - memory_before
+            logger.info(f"Memory usage after {scan_name}: {memory_after:.2f}MB (Δ: {memory_diff:+.2f}MB)")
+
             stderr_output = stderr.decode() if stderr else ""
             if stderr_output:
-                logger.warning(f"Semgrep stderr: {stderr_output}")
-                match = re.search(r"Ran \d+ rules on (\d+) files:", stderr_output)
-                if match:
-                    self.scan_stats['files_scanned'] = int(match.group(1))
+                logger.warning(f"Semgrep stderr ({scan_name}): {stderr_output}")
 
             output = stdout.decode() if stdout else ""
             if not output.strip():
-                return self._create_empty_result()
+                return self._create_empty_result(error=f"No output from {scan_name}")
 
             try:
                 results = json.loads(output)
-                return self._process_scan_results(results)
+                processed_results = self._process_scan_results(results)
+                scan_duration = time.time() - start_time
+                self.scan_stats['scan_durations'][scan_name] = scan_duration
+                
+                processed_results['scan_source'] = scan_name
+                processed_results['scan_duration'] = scan_duration
+                processed_results['memory_usage'] = {
+                    'before': memory_before,
+                    'after': memory_after,
+                    'difference': memory_diff
+                }
+                
+                logger.info(f"Completed {scan_name} scan in {scan_duration:.2f}s")
+                return processed_results
+
             except json.JSONDecodeError as e:
-                logger.error(f"Failed to parse Semgrep JSON output: {str(e)}")
-                return self._create_empty_result(error="Invalid Semgrep output format")
+                error_msg = f"Failed to parse {scan_name} output: {str(e)}"
+                logger.error(error_msg)
+                return self._create_empty_result(error=error_msg)
 
         except Exception as e:
-            logger.error(f"Error in semgrep scan: {str(e)}")
-            return self._create_empty_result(error=str(e))
+            error_msg = f"Error in {scan_name} scan: {str(e)}"
+            logger.error(error_msg)
+            return self._create_empty_result(error=error_msg)
+
         finally:
             if semgrepignore_path.exists():
                 semgrepignore_path.unlink()
 
+    async def run_multiple_semgrep_scans(self, target_dir: Path) -> Dict:
+        """Run multiple semgrep scans based on detected language"""
+        try:
+            logger.info(f"Detected repository language: {self.detected_language}")
+            
+            # Get relevant configs based on language
+            selected_configs = self.get_language_specific_configs(self.detected_language)
+            
+            # Add these lines for progress tracking
+            project_url = getattr(self, '_project_url', '')  
+            user_id = getattr(self, '_user_id', '')  
+            project_id = self._extract_project_id(project_url, None, use_cached=True)
+            total_configs = len(selected_configs)
+            
+            all_results = []
+            merged_findings = []
+            total_files_scanned = 0
+            total_files_skipped = 0
+            severity_counts = defaultdict(int)
+            category_counts = defaultdict(int)
+            seen_findings = set()
+            errors = []
+
+            # Run selected scans sequentially
+            for i, scan_config in enumerate(selected_configs):
+                try:
+                    # Update progress here
+                    progress = (i / total_configs) * 100
+                    update_scan_progress(user_id, project_id, 'analyzing', progress)
+                    
+                    logger.info(f"Starting scan with config: {scan_config['name']} ({scan_config['rules_count']} rules)")
+                    result = await self._run_semgrep_scan(target_dir, scan_config)
+                    all_results.append(result)
+
+                    findings = result.get('findings', [])
+                    stats = result.get('stats', {})
+                    
+                    # Update counters
+                    total_files_scanned = max(
+                        total_files_scanned,
+                        stats.get('scan_stats', {}).get('files_scanned', 0)
+                    )
+                    total_files_skipped += stats.get('scan_stats', {}).get('skipped_files', 0)
+
+                    # Process and deduplicate findings
+                    for finding in findings:
+                        finding_id = (
+                            finding.get('file', ''),
+                            finding.get('line_start', 0),
+                            finding.get('line_end', 0),
+                            finding.get('code_snippet', '')
+                        )
+
+                        if finding_id not in seen_findings:
+                            seen_findings.add(finding_id)
+                            finding['scan_source'] = scan_config['name']
+                            merged_findings.append(finding)
+                            severity = finding.get('severity', 'UNKNOWN').upper()
+                            category = finding.get('category', 'unknown')
+                            severity_counts[severity] += 1
+                            category_counts[category] += 1
+
+                except Exception as e:
+                    error_msg = f"Error in {scan_config['name']} scan: {str(e)}"
+                    logger.error(error_msg)
+                    errors.append({
+                        'config': scan_config['name'],
+                        'error': str(e),
+                        'timestamp': datetime.now().isoformat()
+                    })
+
+            # Log finding counts
+            logger.info(f"Found {len(merged_findings)} total findings")
+            logger.info(f"Severity distribution: {dict(severity_counts)}")
+
+            return {
+                'findings': merged_findings,  
+                'stats': {
+                    'total_findings': len(merged_findings),
+                    'severity_counts': dict(severity_counts),
+                    'category_counts': dict(category_counts),
+                    'scan_stats': {
+                        'files_scanned': total_files_scanned,
+                        'skipped_files': total_files_skipped,
+                        'files_with_findings': len(set(f.get('file', '') for f in merged_findings))
+                    },
+                    'memory_usage_mb': psutil.Process().memory_info().rss / (1024 * 1024),
+                    'scan_durations': self.scan_stats['scan_durations']
+                },
+                'errors': errors if errors else None,
+                'language': self.detected_language
+            }
+
+        except Exception as e:
+            logger.error(f"Critical error in scan execution: {str(e)}")
+            if self._user_id and self._project_url:
+                project_id = self._extract_project_id(self._project_url, None, use_cached=True)
+                update_scan_progress(self._user_id, project_id, 'error', 0)
+            
+            return self._create_empty_result(error=str(e))
+
     def _process_scan_results(self, results: Dict) -> Dict:
-        """Process scan results with accurate file counting from semgrep output"""
+        """Process and normalize scan results"""
         findings = results.get('results', [])
         stats = results.get('stats', {})
         paths = results.get('paths', {})
@@ -354,19 +643,32 @@ class GitLabSecurityScanner:
                 },
                 'category_counts': {},
                 'scan_stats': self.scan_stats,
-                'memory_usage_mb': self.scan_stats['memory_usage_mb']
+                'memory_usage_mb': self.scan_stats.get('memory_usage_mb', 0)
             },
             'errors': [error] if error else []
         }
 
-    def _extract_project_id(self, project_url: str, access_token: str) -> int:
-        """Extract GitLab project ID from URL or path"""
+    def _extract_project_id(self, project_url: str, access_token: str = None, use_cached: bool = False) -> str:
+        """Extract GitLab project ID from URL or path, with caching option"""
+        
+        # If using cached ID and we have a valid project URL, parse it from the URL
+        # This is useful when we've already looked up the project ID but need it again without an API call
+        if use_cached and hasattr(self, '_cached_project_id'):
+            return self._cached_project_id
+            
         try:
             # Handle both URL and path formats
-            if 'gitlab.com' in project_url:
+            if project_url and 'gitlab.com' in project_url:
                 path = project_url.split('gitlab.com/')[-1].rstrip('.git')
-            else:
+            elif project_url:
                 path = project_url.lstrip('/')
+            else:
+                raise ValueError("Project URL is empty")
+            
+            # If we don't have an access token, just return the encoded path as the ID
+            # This is useful for progress tracking where we just need a consistent ID
+            if not access_token:
+                return path.replace('/', '%2F')
             
             # Make API call to get project ID using OAuth token
             url = f"https://gitlab.com/api/v4/projects/{path.replace('/', '%2F')}"
@@ -377,8 +679,12 @@ class GitLabSecurityScanner:
             
             if response.status_code == 200:
                 project_data = response.json()
-                logger.info(f"Successfully got project ID: {project_data['id']}")
-                return project_data['id']
+                project_id = str(project_data['id'])
+                logger.info(f"Successfully got project ID: {project_id}")
+                
+                # Cache the project ID for future use
+                self._cached_project_id = project_id
+                return project_id
                 
             logger.error(f"Failed to get project ID. Status: {response.status_code}, Response: {response.text}")
             raise ValueError(f"Failed to get project ID for {path}. Status: {response.status_code}")
@@ -388,48 +694,73 @@ class GitLabSecurityScanner:
             raise ValueError(f"Invalid GitLab project URL or path: {str(e)}")
 
     async def scan_repository(self, project_url: str, access_token: str, user_id: str) -> Dict:
-        """Main method to scan a repository"""
-        repo_name = project_url.split('/')[-1].replace('.git', '')
+        """Main method to scan a repository with multiple configurations based on language"""
         try:
-            # Update progress to initializing
-            update_scan_progress(user_id, repo_name, 'initializing', 0)
+            # Store project URL and user ID for progress tracking
+            self.set_scan_info(project_url, user_id)
             
-            # Extract project ID
+            # Extract project ID for progress tracking
             project_id = self._extract_project_id(project_url, access_token)
-            logger.info(f"Extracted project ID: {project_id}")
             
-            # Update progress to cloning
-            update_scan_progress(user_id, repo_name, 'cloning', 20)
+            # Update progress to initializing
+            update_scan_progress(user_id, project_id, 'initializing', 0)
             
+            # Check repository size and language in a single API call
+            size_info = await self._check_repository_size(int(project_id), access_token)
+            update_scan_progress(user_id, project_id, 'cloning', 20)
+                
             # Clone repository
             repo_dir = await self._clone_repository(project_url, access_token)
+            update_scan_progress(user_id, project_id, 'analyzing', 40)
+
+            # Run multiple scans based on detected language
+            scan_results = await self.run_multiple_semgrep_scans(repo_dir)
+            update_scan_progress(user_id, project_id, 'processing', 70)
+
+            # Get all findings
+            all_findings = scan_results.get('findings', [])
+            logger.info(f"Found {len(all_findings)} total findings")
+
+            # Prepare reranking data
+            selected_findings = all_findings
+            if len(all_findings) > 50:
+                # If we have more than 50 findings, prioritize by severity for reranking
+                error_findings = [f for f in all_findings if f.get('severity', '').upper() == 'CRITICAL']
+                high_findings = [f for f in all_findings if f.get('severity', '').upper() == 'HIGH']
+                medium_findings = [f for f in all_findings if f.get('severity', '').upper() == 'MEDIUM']
+                low_findings = [f for f in all_findings if f.get('severity', '').upper() == 'LOW']
+                info_findings = [f for f in all_findings if f.get('severity', '').upper() == 'INFO']
+                
+                # Add findings in priority order up to 50
+                selected_findings = []
+                remaining = 50
+                
+                for severity_findings in [error_findings, high_findings, medium_findings, low_findings, info_findings]:
+                    if remaining > 0:
+                        to_add = severity_findings[:remaining]
+                        selected_findings.extend(to_add)
+                        remaining -= len(to_add)
             
-            # Update progress to analyzing
-            update_scan_progress(user_id, repo_name, 'analyzing', 40)
+            # Add IDs to findings if needed
+            for idx, finding in enumerate(selected_findings, 1):
+                if 'ID' not in finding:
+                    finding['ID'] = idx
             
-            # Run scan
-            scan_results = await self._run_semgrep_scan(repo_dir)
-            
-            # Update progress to processing
-            update_scan_progress(user_id, repo_name, 'processing', 70)
-            
-            findings = scan_results.get('findings', [])
-            logger.info(f"Found {len(findings)} total findings")
-            
-            # Select findings for reranking (top 50 or all if less than 50)
-            selected_findings = sort_findings_by_severity(findings)[:50] if len(findings) > 50 else findings
-            
+            # Prepare complete results data
             results_data = {
-                'findings': scan_results.get('findings', []),
+                'findings': all_findings,
                 'stats': scan_results.get('stats', {}),
                 'metadata': {
-                    'scan_duration_seconds': (
-                        datetime.now() - self.scan_stats['start_time']
-                    ).total_seconds() if self.scan_stats['start_time'] else 0,
-                    'memory_usage_mb': scan_results.get('stats', {}).get('memory_usage_mb', 0)
+                    'repository_url': project_url,
+                    'project_id': project_id,
+                    'user_id': user_id,
+                    'scan_start': self.scan_stats['start_time'].isoformat(),
+                    'scan_end': datetime.now().isoformat(),
+                    'scan_duration_seconds': (datetime.now() - self.scan_stats['start_time']).total_seconds(),
+                    'language': self.detected_language
                 },
                 'summary': {
-                    'total_findings': scan_results.get('stats', {}).get('total_findings', 0),
+                    'total_findings': len(all_findings),
                     'severity_counts': scan_results.get('stats', {}).get('severity_counts', {}),
                     'category_counts': scan_results.get('stats', {}).get('category_counts', {}),
                     'files_scanned': scan_results.get('stats', {}).get('scan_stats', {}).get('files_scanned', 0),
@@ -440,7 +771,7 @@ class GitLabSecurityScanner:
             }
             
             # Update progress to reranking
-            update_scan_progress(user_id, repo_name, 'reranking', 85)
+            update_scan_progress(user_id, project_id, 'reranking', 85)
             
             # Update database with full results
             if self.db_session and self.analysis_id:
@@ -448,7 +779,7 @@ class GitLabSecurityScanner:
                     analysis = self.db_session.query(GitLabAnalysisResult).get(self.analysis_id)
                     if analysis:
                         analysis.results = results_data
-                        analysis.rerank = selected_findings  # Store selected findings for reranking
+                        analysis.rerank = selected_findings 
                         analysis.status = 'completed'
                         analysis.completed_at = datetime.now()
                         self.db_session.commit()
@@ -458,7 +789,7 @@ class GitLabSecurityScanner:
                     logger.error(f"Failed to update analysis results: {str(e)}")
             
             # Update progress to completed
-            update_scan_progress(user_id, repo_name, 'completed', 100)
+            update_scan_progress(user_id, project_id, 'completed', 100)
             
             return {
                 'success': True,
@@ -467,9 +798,17 @@ class GitLabSecurityScanner:
                     'project_id': project_id,
                     'user_id': user_id,
                     'timestamp': datetime.now().isoformat(),
-                    'findings': scan_results.get('findings', []),
+                    'findings': all_findings,
                     'summary': results_data['summary'],
-                    'metadata': results_data['metadata']
+                    'metadata': results_data['metadata'],
+                    'repository_info': {
+                        'size_mb': size_info['size_mb'],
+                        'primary_language': size_info['language'],
+                        'default_branch': size_info['default_branch'],
+                        'visibility': size_info['visibility'],
+                        'star_count': size_info['star_count'],
+                        'fork_count': size_info['fork_count']
+                    }
                 }
             }
                 
@@ -477,7 +816,11 @@ class GitLabSecurityScanner:
             logger.error(f"Scan repository error: {str(e)}")
             
             # Update progress to error
-            update_scan_progress(user_id, repo_name, 'error', 0)
+            try:
+                if user_id and project_id:
+                    update_scan_progress(user_id, project_id, 'error', 0)
+            except Exception as pe:
+                logger.error(f"Error updating progress: {str(pe)}")
             
             if self.db_session and self.analysis_id:
                 try:
@@ -500,282 +843,3 @@ class GitLabSecurityScanner:
                     'timestamp': datetime.now().isoformat()
                 }
             }
-# Helper functions
-def format_file_size(size_bytes: int) -> str:
-    """Convert bytes to human readable format"""
-    for unit in ['B', 'KB', 'MB', 'GB']:
-        if size_bytes < 1024:
-            return f"{size_bytes:.2f} {unit}"
-        size_bytes /= 1024
-    return f"{size_bytes:.2f} TB"
-
-def validate_gitlab_url(url: str) -> bool:
-    """Validate GitLab repository URL format"""
-    if not url:
-        return False
-    
-    valid_formats = [
-        r'https://gitlab\.com/[\w-]+/[\w-]+(?:\.git)?$',
-        r'git@gitlab\.com:[\w-]+/[\w-]+(?:\.git)?$'
-    ]
-    
-    return any(re.match(pattern, url) for pattern in valid_formats)
-
-def get_severity_weight(severity: str) -> int:
-    """Get numerical weight for severity level for sorting"""
-    weights = {
-        'CRITICAL': 5,
-        'HIGH': 4,
-        'MEDIUM': 3,
-        'LOW': 2,
-        'INFO': 1
-    }
-    return weights.get(severity.upper(), 0)
-
-def sort_findings_by_severity(findings: List[Dict]) -> List[Dict]:
-    """Sort findings by severity level"""
-    return sorted(
-        findings,
-        key=lambda x: get_severity_weight(x.get('severity', 'INFO')),
-        reverse=True
-    )
-
-def deduplicate_findings(scan_results: Dict[str, Any]) -> Dict[str, Any]:
-    """Remove duplicate findings from scan results based on multiple criteria"""
-    if not scan_results.get('success') or 'data' not in scan_results:
-        return scan_results
-
-    original_summary = scan_results['data'].get('summary', {})
-    findings = scan_results['data'].get('findings', [])
-    
-    if not findings:
-        return scan_results
-    
-    seen_findings = set()
-    deduplicated_findings = []
-    
-    for finding in findings:
-        finding_signature = (
-            finding.get('file', ''),
-            finding.get('line_start', 0),
-            finding.get('line_end', 0),
-            finding.get('category', ''),
-            finding.get('severity', ''),
-            finding.get('code_snippet', '')
-        )
-        
-        if finding_signature not in seen_findings:
-            seen_findings.add(finding_signature)
-            deduplicated_findings.append(finding)
-    
-    severity_counts = defaultdict(int)
-    category_counts = defaultdict(int)
-    
-    for finding in deduplicated_findings:
-        severity = finding.get('severity', 'UNKNOWN')
-        category = finding.get('category', 'unknown')
-        severity_counts[severity] += 1
-        category_counts[category] += 1
-    
-    updated_summary = {
-        'total_findings': len(deduplicated_findings),
-        'files_scanned': original_summary.get('files_scanned', 0),
-        'files_with_findings': original_summary.get('files_with_findings', 0),
-        'skipped_files': original_summary.get('skipped_files', 0),
-        'partially_scanned': original_summary.get('partially_scanned', 0),
-        'severity_counts': dict(severity_counts),
-        'category_counts': dict(category_counts),
-        'deduplication_info': {
-            'original_count': len(findings),
-            'deduplicated_count': len(deduplicated_findings),
-            'duplicates_removed': len(findings) - len(deduplicated_findings)
-        }
-    }
-    
-    scan_results['data']['findings'] = deduplicated_findings
-    scan_results['data']['summary'] = updated_summary
-    
-    return scan_results
-
-async def scan_gitlab_repository_handler(
-    project_url: str,
-    access_token: str,
-    user_id: str,
-    db_session: Optional[Session] = None,
-    analysis_record: Optional[GitLabAnalysisResult] = None
-) -> Dict:
-    """Handler function for GitLab web routes with input validation"""
-    logger.info(f"Starting scan request for GitLab project: {project_url}")
-    
-    if not all([project_url, access_token, user_id]):
-        return {
-            'success': False,
-            'error': {
-                'message': 'Missing required parameters',
-                'code': 'INVALID_PARAMETERS'
-            }
-        }
-
-    if not validate_gitlab_url(project_url):
-        return {
-            'success': False,
-            'error': {
-                'message': 'Invalid project URL format',
-                'code': 'INVALID_PROJECT_URL',
-                'details': 'Only GitLab.com repositories are supported'
-            }
-        }
-
-    try:
-        # Extract repository name for progress tracking
-        repo_name = project_url.split('/')[-1].replace('.git', '')
-        
-        # Clear previous progress
-        from progress_tracking import clear_scan_progress
-        clear_scan_progress(user_id, repo_name)
-        
-        # Initialize scanner with config and record ID
-        config = GitLabScanConfig()
-        analysis_id = analysis_record.id if analysis_record else None
-        
-        async with GitLabSecurityScanner(config, db_session, analysis_id) as scanner:
-            try:
-                # Get project ID and check size (update with progress)
-                update_scan_progress(user_id, repo_name, 'validating', 10)
-                
-                # Extract project ID (numeric)
-                project_id = scanner._extract_project_id(project_url, access_token)
-                
-                # Update project_id in database if possible
-                if analysis_record and db_session:
-                    try:
-                        analysis_record.project_id = str(project_id)
-                        db_session.commit()
-                    except Exception as e:
-                        logger.error(f"Failed to update project ID: {str(e)}")
-                        db_session.rollback()
-                
-                # Check repository size
-                size_info = await scanner._check_repository_size(project_id, access_token)
-                
-                if not size_info['is_compatible']:
-                    # Update progress to error
-                    update_scan_progress(user_id, repo_name, 'error', 0)
-                    
-                    # Update analysis record
-                    if analysis_record and db_session:
-                        try:
-                            analysis_record.status = 'error'
-                            analysis_record.error = f"Repository too large: {size_info['size_mb']}MB"
-                            analysis_record.completed_at = datetime.now()
-                            db_session.commit()
-                        except Exception:
-                            db_session.rollback()
-                    
-                    return {
-                        'success': False,
-                        'error': {
-                            'message': 'Repository too large for analysis',
-                            'code': 'REPOSITORY_TOO_LARGE',
-                            'details': {
-                                'size_mb': size_info['size_mb'],
-                                'limit_mb': config.max_total_size_mb,
-                                'recommendation': 'Consider analyzing specific directories or branches'
-                            }
-                        }
-                    }
-                
-                # Run the scan with progress tracking
-                results = await scanner.scan_repository(
-                    project_url,
-                    access_token,
-                    user_id
-                )
-                
-                # Enrich results with repository info
-                if results.get('success'):
-                    results['data']['repository_info'] = {
-                        'size_mb': size_info['size_mb'],
-                        'primary_language': size_info['language'],
-                        'default_branch': size_info['default_branch']
-                    }
-                
-                # Deduplicate findings before returning
-                return deduplicate_findings(results)
-
-            except ValueError as ve:
-                # Update progress to error
-                update_scan_progress(user_id, repo_name, 'error', 0)
-                
-                # Update analysis record
-                if analysis_record and db_session:
-                    try:
-                        analysis_record.status = 'error'
-                        analysis_record.error = str(ve)
-                        analysis_record.completed_at = datetime.now()
-                        db_session.commit()
-                    except Exception:
-                        db_session.rollback()
-                
-                return {
-                    'success': False,
-                    'error': {
-                        'message': str(ve),
-                        'code': 'VALIDATION_ERROR',
-                        'timestamp': datetime.now().isoformat()
-                    }
-                }
-            
-            except git.GitCommandError as ge:
-                # Update progress to error
-                update_scan_progress(user_id, repo_name, 'error', 0)
-                
-                # Update analysis record
-                if analysis_record and db_session:
-                    try:
-                        analysis_record.status = 'error'
-                        analysis_record.error = f"Git error: {str(ge)}"
-                        analysis_record.completed_at = datetime.now()
-                        db_session.commit()
-                    except Exception:
-                        db_session.rollback()
-                
-                return {
-                    'success': False,
-                    'error': {
-                        'message': 'Git operation failed',
-                        'code': 'GIT_ERROR',
-                        'details': str(ge),
-                        'timestamp': datetime.now().isoformat()
-                    }
-                }
-
-    except Exception as e:
-        # Update progress to error if possible
-        try:
-            repo_name = project_url.split('/')[-1].replace('.git', '')
-            update_scan_progress(user_id, repo_name, 'error', 0)
-        except:
-            pass
-        
-        # Update analysis record
-        if analysis_record and db_session:
-            try:
-                analysis_record.status = 'error'
-                analysis_record.error = str(e)
-                analysis_record.completed_at = datetime.now()
-                db_session.commit()
-            except Exception:
-                db_session.rollback()
-        
-        logger.error(f"Handler error: {str(e)}")
-        return {
-            'success': False,
-            'error': {
-                'message': 'Unexpected error in scan handler',
-                'code': 'INTERNAL_ERROR',
-                'details': str(e),
-                'type': type(e).__name__,
-                'timestamp': datetime.now().isoformat()
-            }
-        }

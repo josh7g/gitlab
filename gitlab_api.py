@@ -26,6 +26,7 @@ from gitlab_scanner import (
     GitLabSecurityScanner
 )
 from typing import Dict, List, Optional, Union, Any, Tuple
+import re
 
 logging.basicConfig(
     level=logging.INFO,
@@ -165,7 +166,7 @@ def refresh_access_token():
             'success': True,
             'data': {
                 'access_token': new_token_data['access_token'],
-                'refresh_token': new_token_data.get('refresh_token'),  # GitLab might provide new refresh token
+                'refresh_token': new_token_data.get('refresh_token'), 
                 'expires_in': new_token_data.get('expires_in', 7200),
                 'created_at': datetime.utcnow().isoformat()
             }
@@ -352,7 +353,7 @@ def trigger_specific_repository_scan(repo_id):
             db_session.close()
             logger.info("Database session closed")
 
-def handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session):
+def handle_reranking_failure(findings, user_id, project_url, gitlab_user_id, analysis, db_session):
     """Helper function to handle reranking failures by falling back to original order"""
     logger.info("Falling back to original findings order due to reranking failure")
     
@@ -373,16 +374,16 @@ def handle_reranking_failure(findings, project_id, project_url, user_id, analysi
         'files_with_findings': len(set(f.get('file', '') for f in findings))
     }
     
-    # Store in database
+    # Store in database - with updated parameter mappings
     results_data = {
         'findings': findings,
         'summary': summary,
         'metadata': {
             'scan_duration_seconds': 0,
             'timestamp': datetime.utcnow().isoformat(),
-            'user_id': project_id,  
+            'user_id': user_id,  # This was project_id before
             'project_url': project_url,
-            'gitlab_user_id': user_id,  
+            'gitlab_user_id': gitlab_user_id,  # This was user_id before
             'reranking': 'failed_used_original'
         }
     }
@@ -397,7 +398,7 @@ def handle_reranking_failure(findings, project_id, project_url, user_id, analysi
         logger.error(f"Database error when handling reranking failure: {str(e)}")
         db_session.rollback()
 
-def rerank_findings(findings, user_id, project_url, project_id, analysis, db_session):
+def rerank_findings(findings, user_id, project_url, gitlab_user_id, analysis, db_session):
     """Helper function to rerank findings through AI with improved logging and fallback"""
     try:
         if not findings:
@@ -422,7 +423,7 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
             'metadata': {
                 'repository': project_url.split('gitlab.com/')[-1],
                 'project_url': project_url,
-                'gitlab_user_id': user_id,
+                'user_id': user_id,
                 'timestamp': datetime.utcnow().isoformat(),
                 'scan_id': analysis.id if analysis else None
             }
@@ -465,9 +466,9 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
                 'metadata': {
                     'scan_duration_seconds': 0,  # We don't have this info here
                     'timestamp': datetime.utcnow().isoformat(),
-                    'user_id': project_id,
+                    'user_id': gitlab_user_id,  # Properly mapped from original parameter order
                     'project_url': project_url,
-                    'gitlab_user_id': user_id,
+                    'gitlab_user_id': user_id,  # Properly mapped from original parameter order
                     'reranking': 'skipped_no_url'
                 }
             }
@@ -550,9 +551,9 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
                         'metadata': {
                             'scan_duration_seconds': 0,  # We don't have this info here
                             'timestamp': datetime.utcnow().isoformat(),
-                            'user_id': project_id,
+                            'user_id': gitlab_user_id,  # Properly mapped from original parameter order
                             'project_url': project_url,
-                            'gitlab_user_id': user_id,
+                            'gitlab_user_id': user_id,  # Properly mapped from original parameter order
                             'reranking': 'completed'
                         }
                     }
@@ -565,28 +566,27 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
                 except json.JSONDecodeError as je:
                     logger.error(f"Failed to parse reranking JSON response: {str(je)}")
                     # Fall back to original order
-                    handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
+                    handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
             else:
                 logger.error(f"LLM reranking failed: {response.status_code} - {response_text}")
                 # Fall back to original order
-                handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
+                handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
                 
         except Exception as e:
             logger.error(f"Error calling LLM service: {str(e)}")
             logger.error(traceback.format_exc())
             # Fall back to original order
-            handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
+            handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
     
     except Exception as e:
         logger.error(f"Error in rerank_findings: {str(e)}")
         logger.error(traceback.format_exc())
         try:
             # Fall back to original order
-            handle_reranking_failure(findings, project_id, project_url, user_id, analysis, db_session)
+            handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
         except:
             db_session.rollback()
             logger.error("Critical failure in reranking fallback handler")
-
 
 def extract_ids_from_llm_response(response_data: Union[Dict, List, str], original_findings: List[Dict] = None) -> Optional[List[int]]:
     """
@@ -640,6 +640,7 @@ def extract_ids_from_llm_response(response_data: Union[Dict, List, str], origina
         logger.error(f"Error extracting IDs from LLM response: {str(e)}")
         logger.error(f"Full traceback: {traceback.format_exc()}")
         return list(range(1, len(original_findings) + 1)) if original_findings else None
+    
 
 @gitlab_bp.route('/repositories', methods=['GET'])
 def list_repositories():
@@ -1150,17 +1151,23 @@ def trigger_general_repository_scan():
         }), 400
     
     # Get required parameters
-    project_id = request_data.get('project_id')
+    # Note: Keep accepting the same parameters as before, but map them correctly
+    project_id = request_data.get('project_id')  # For backward compatibility
+    user_id = request_data.get('user_id')  # This will be our "user_id" in the API but go to user_id DB field
+    gitlab_user_id = request_data.get('gitlab_user_id')  # This will be our gitlab_user_id field
     project_url = request_data.get('project_url')
     access_token = request_data.get('access_token')
-    user_id = request_data.get('user_id')
+    
+    # Handle cases where we may still get project_id but user_id is preferred
+    if project_id and not user_id:
+        user_id = project_id  # Use project_id as user_id for backward compatibility
     
     # Validate required parameters
     required_params = {
-        'project_id': project_id,
+        'user_id': user_id,
         'project_url': project_url, 
         'access_token': access_token,
-        'user_id': user_id
+        'gitlab_user_id': gitlab_user_id
     }
     
     missing_params = [param for param, value in required_params.items() if not value]
@@ -1184,19 +1191,18 @@ def trigger_general_repository_scan():
 
         # Create analysis record
         analysis = GitLabAnalysisResult(
-            user_id=project_id, 
+            user_id=user_id,  # User-provided ID (previously project_id)
             project_url=project_url,
-            gitlab_user_id=user_id,  
+            gitlab_user_id=gitlab_user_id,  # GitLab user ID (previously user_id)
             status='queued'
         )
-
         db_session.add(analysis)
         db_session.commit()
         logger.info(f"Created analysis record with ID: {analysis.id}")
         
         # Initialize progress tracking
-        clear_scan_progress(user_id, project_id)
-        update_scan_progress(user_id, project_id, 'initializing', 0)
+        clear_scan_progress(gitlab_user_id, user_id)
+        update_scan_progress(gitlab_user_id, user_id, 'initializing', 0)
 
         # Start scan in background thread
         def run_scan_in_background():
@@ -1211,7 +1217,7 @@ def trigger_general_repository_scan():
                 results = loop.run_until_complete(scan_gitlab_repository_handler(
                     project_url=project_url,
                     access_token=access_token,
-                    user_id=user_id,
+                    user_id=gitlab_user_id,  # Pass the GitLab user ID here
                     db_session=db_session,
                     analysis_record=analysis
                 ))
@@ -1224,8 +1230,8 @@ def trigger_general_repository_scan():
                         if 'ID' not in finding:
                             finding['ID'] = idx
                     
-                    # Call reranking helper
-                    rerank_findings(findings, user_id, project_url, project_id, analysis, db_session)
+                    # Call reranking helper with parameters in the new order
+                    rerank_findings(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
                     
             except Exception as e:
                 # Handle errors
@@ -1233,7 +1239,7 @@ def trigger_general_repository_scan():
                 logger.error(traceback.format_exc())
                 analysis.status = 'error'
                 analysis.error = str(e)
-                update_scan_progress(user_id, project_id, 'error', 0)
+                update_scan_progress(gitlab_user_id, user_id, 'error', 0)
                 db_session.commit()
         
         # Start the background thread
@@ -1248,7 +1254,7 @@ def trigger_general_repository_scan():
             'message': 'GitLab scan queued successfully',
             'scan_id': analysis.id,
             'status': 'queued',
-            'project_id': project_id
+            'user_id': user_id  # Return the user-provided ID (was project_id)
         }), 202  # Return 202 Accepted
         
     except Exception as e:

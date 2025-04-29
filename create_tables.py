@@ -223,26 +223,13 @@ def fix_gitlab_table_schema():
     """Fix any issues with the GitLab table schema"""
     with app.app_context():
         try:
-            # First, inspect the current schema
-            logger.info("Inspecting current gitlab_analysis_results table schema...")
+            # Check if project_id exists
             result = db.session.execute(text("""
-                SELECT column_name, data_type, is_nullable
+                SELECT column_name 
                 FROM information_schema.columns 
-                WHERE table_name = 'gitlab_analysis_results'
-                ORDER BY ordinal_position;
+                WHERE table_name = 'gitlab_analysis_results' AND column_name = 'project_id'
             """))
-            
-            columns = [dict(row) for row in result]
-            logger.info(f"Current columns: {columns}")
-            
-            # Check if project_id exists and if it's NOT NULL
-            project_id_exists = False
-            project_id_not_null = False
-            for col in columns:
-                if col['column_name'] == 'project_id':
-                    project_id_exists = True
-                    project_id_not_null = col['is_nullable'] == 'NO'
-                    break
+            project_id_exists = bool(result.scalar())
             
             if project_id_exists:
                 # Make sure user_id matches project_id for all records
@@ -254,7 +241,6 @@ def fix_gitlab_table_schema():
                 db.session.commit()
                 logger.info("Updated existing records to ensure project_id = user_id")
                 
-            # Update analysis function and handler to include project_id
             logger.info("Schema fix completed!")
             
         except Exception as e:

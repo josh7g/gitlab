@@ -399,14 +399,16 @@ def handle_reranking_failure(findings, user_id, project_url, gitlab_user_id, ana
         db_session.rollback()
 
 def rerank_findings(findings, user_id, project_url, gitlab_user_id, analysis, db_session):
-    """Helper function to rerank findings through AI with improved logging and fallback"""
+    """Helper function to rerank findings through AI with improved logging and database handling"""
     try:
         if not findings:
             logger.info("No findings to rerank")
             analysis.status = 'completed'
             analysis.results = {'findings': [], 'summary': {}, 'metadata': {}}
+            # Explicitly set rerank to empty array instead of None
             analysis.rerank = []
             db_session.commit()
+            logger.info(f"Updated analysis {analysis.id} with empty findings array")
             return
             
         logger.info(f"Preparing to rerank {len(findings)} findings")
@@ -414,14 +416,14 @@ def rerank_findings(findings, user_id, project_url, gitlab_user_id, analysis, db
         # Prepare data for LLM
         llm_data = {
             'findings': [{
-                "ID": finding["ID"],
+                "ID": finding.get("ID", idx+1),  # Ensure every finding has an ID
                 "file": finding.get("file", ""),
                 "code_snippet": finding.get("code_snippet", ""),
                 "message": finding.get("message", ""),
                 "severity": finding.get("severity", "")
-            } for finding in findings],
+            } for idx, finding in enumerate(findings)],
             'metadata': {
-                'repository': project_url.split('gitlab.com/')[-1],
+                'repository': project_url.split('gitlab.com/')[-1] if 'gitlab.com/' in project_url else project_url,
                 'project_url': project_url,
                 'user_id': user_id,
                 'timestamp': datetime.utcnow().isoformat(),
@@ -429,161 +431,170 @@ def rerank_findings(findings, user_id, project_url, gitlab_user_id, analysis, db
             }
         }
         
-        # Log the data being sent to LLM
-        logger.info(f"Data being sent to LLM reranking service:")
-        logger.info(f"Number of findings: {len(llm_data['findings'])}")
-        logger.info(f"Metadata: {json.dumps(llm_data['metadata'])}")
-        logger.info(f"Sample findings (first 2): {json.dumps(llm_data['findings'][:2] if len(llm_data['findings']) >= 2 else llm_data['findings'])}")
-        
         # Call LLM reranking service
         AI_RERANK_URL = os.getenv('RERANK_API_URL')
         if not AI_RERANK_URL:
-            logger.error("RERANK_API_URL not configured, skipping reranking and using original order")
-            # Create finding dictionary by ID - using original order
+            logger.warning("RERANK_API_URL not configured, using original order")
+            # Use original order as reranked findings
             reordered_findings = findings
-            
-            # Prepare results structure with stats
-            severity_counts = defaultdict(int)
-            category_counts = defaultdict(int)
-            for finding in findings:
-                severity = finding.get('severity', 'INFO')
-                category = finding.get('category', 'unknown')
-                severity_counts[severity] += 1
-                category_counts[category] += 1
-            
-            summary = {
-                'total_findings': len(findings),
-                'severity_counts': dict(severity_counts),
-                'category_counts': dict(category_counts),
-                'files_scanned': len(set(f.get('file', '') for f in findings)),
-                'files_with_findings': len(set(f.get('file', '') for f in findings))
+        else:
+            try:
+                # Synchronous call for simplicity in this thread
+                headers = {'Content-Type': 'application/json'}
+                logger.info(f"Calling reranking service at: {AI_RERANK_URL}")
+                
+                response = requests.post(
+                    AI_RERANK_URL, 
+                    headers=headers,
+                    json=llm_data,
+                    timeout=60
+                )
+                
+                logger.info(f"Reranking service response status: {response.status_code}")
+                logger.info(f"Reranking service response headers: {response.headers}")
+                
+                response_text = response.text
+                logger.info(f"Reranking service raw response: {response_text}")
+                
+                if response.status_code == 200:
+                    try:
+                        response_data = response.json()
+                        logger.info(f"Parsed JSON response: {json.dumps(response_data)}")
+                        
+                        reranked_ids = extract_ids_from_llm_response(response_data, findings)
+                        
+                        # Always ensure we have valid IDs, falling back to original order if needed
+                        if not reranked_ids or len(reranked_ids) == 0:
+                            logger.warning("No valid IDs returned from reranking service, using original order")
+                            reranked_ids = list(range(1, len(findings) + 1))
+                        
+                        # Create finding dictionary by ID
+                        findings_map = {finding.get('ID', idx+1): finding for idx, finding in enumerate(findings)}
+                        
+                        # Create reordered list
+                        reordered_findings = []
+                        for rank_id in reranked_ids:
+                            if rank_id in findings_map:
+                                reordered_findings.append(findings_map[rank_id])
+                            else:
+                                logger.warning(f"ID {rank_id} from reranking not found in findings")
+                        
+                        # If somehow we ended up with no findings after reranking, use original order
+                        if not reordered_findings:
+                            logger.warning("Reranking resulted in empty findings list, using original order")
+                            reordered_findings = findings
+                            
+                    except json.JSONDecodeError as je:
+                        logger.error(f"Failed to parse reranking JSON response: {str(je)}")
+                        # Fall back to original order
+                        reordered_findings = findings
+                else:
+                    logger.error(f"LLM reranking failed: {response.status_code} - {response_text}")
+                    # Fall back to original order
+                    reordered_findings = findings
+                    
+            except Exception as e:
+                logger.error(f"Error calling LLM service: {str(e)}")
+                logger.error(traceback.format_exc())
+                # Fall back to original order
+                reordered_findings = findings
+        
+        # Prepare statistics
+        severity_counts = defaultdict(int)
+        category_counts = defaultdict(int)
+        for finding in findings:
+            severity = finding.get('severity', 'INFO')
+            category = finding.get('category', 'unknown')
+            severity_counts[severity] += 1
+            category_counts[category] += 1
+        
+        summary = {
+            'total_findings': len(findings),
+            'severity_counts': dict(severity_counts),
+            'category_counts': dict(category_counts),
+            'files_scanned': len(set(f.get('file', '') for f in findings)),
+            'files_with_findings': len(set(f.get('file', '') for f in findings))
+        }
+        
+        # Store in database - IMPORTANT: ensure reordered_findings is never None
+        results_data = {
+            'findings': findings,
+            'summary': summary,
+            'metadata': {
+                'scan_duration_seconds': 0,
+                'timestamp': datetime.utcnow().isoformat(),
+                'user_id': gitlab_user_id,
+                'project_url': project_url,
+                'gitlab_user_id': user_id,
+                'reranking': 'completed'
             }
-            
-            # Store in database
-            results_data = {
-                'findings': findings,
-                'summary': summary,
-                'metadata': {
-                    'scan_duration_seconds': 0,  # We don't have this info here
-                    'timestamp': datetime.utcnow().isoformat(),
-                    'user_id': gitlab_user_id,  # Properly mapped from original parameter order
-                    'project_url': project_url,
-                    'gitlab_user_id': user_id,  # Properly mapped from original parameter order
-                    'reranking': 'skipped_no_url'
-                }
-            }
-            
+        }
+        
+        # CRITICAL FIX: Ensure we're not setting rerank to None
+        if not reordered_findings:
+            logger.warning("Reordered findings is empty, using original findings as fallback")
+            reordered_findings = findings
+        
+        # Update database with explicit commit and better error handling
+        try:
             analysis.status = 'completed'
             analysis.results = results_data
-            analysis.rerank = reordered_findings
-            db_session.commit()
-            logger.info(f"Successfully stored original findings (no reranking) and updated analysis {analysis.id}")
-            return
             
-        try:
-            # Synchronous call for simplicity in this thread
-            headers = {'Content-Type': 'application/json'}
-            logger.info(f"Calling reranking service at: {AI_RERANK_URL}")
-            
-            response = requests.post(
-                AI_RERANK_URL, 
-                headers=headers,
-                json=llm_data,
-                timeout=60  # Add timeout to prevent hanging
-            )
-            
-            # Log the complete response
-            logger.info(f"Reranking service response status: {response.status_code}")
-            logger.info(f"Reranking service response headers: {response.headers}")
-            
-            response_text = response.text
-            logger.info(f"Reranking service raw response: {response_text}")
-            
-            if response.status_code == 200:
-                try:
-                    response_data = response.json()
-                    logger.info(f"Parsed JSON response: {json.dumps(response_data)}")
-                    
-                    reranked_ids = extract_ids_from_llm_response(response_data, findings)
-                    
-                    # Always ensure we have valid IDs, falling back to original order if needed
-                    if not reranked_ids or len(reranked_ids) == 0:
-                        logger.warning("No valid IDs returned from reranking service, using original order")
-                        reranked_ids = list(range(1, len(findings) + 1))
-                    
-                    # Create finding dictionary by ID
-                    findings_map = {finding['ID']: finding for finding in findings}
-                    
-                    # Create reordered list
-                    reordered_findings = []
-                    for rank_id in reranked_ids:
-                        if rank_id in findings_map:
-                            reordered_findings.append(findings_map[rank_id])
-                        else:
-                            logger.warning(f"ID {rank_id} from reranking not found in findings")
-                    
-                    # If somehow we ended up with no findings after reranking, use original order
-                    if not reordered_findings:
-                        logger.warning("Reranking resulted in empty findings list, using original order")
-                        reordered_findings = findings
-                    
-                    # Prepare results structure with stats
-                    severity_counts = defaultdict(int)
-                    category_counts = defaultdict(int)
-                    for finding in findings:
-                        severity = finding.get('severity', 'INFO')
-                        category = finding.get('category', 'unknown')
-                        severity_counts[severity] += 1
-                        category_counts[category] += 1
-                    
-                    summary = {
-                        'total_findings': len(findings),
-                        'severity_counts': dict(severity_counts),
-                        'category_counts': dict(category_counts),
-                        'files_scanned': len(set(f.get('file', '') for f in findings)),
-                        'files_with_findings': len(set(f.get('file', '') for f in findings))
-                    }
-                    
-                    # Store in database
-                    results_data = {
-                        'findings': findings,
-                        'summary': summary,
-                        'metadata': {
-                            'scan_duration_seconds': 0,  # We don't have this info here
-                            'timestamp': datetime.utcnow().isoformat(),
-                            'user_id': gitlab_user_id,  # Properly mapped from original parameter order
-                            'project_url': project_url,
-                            'gitlab_user_id': user_id,  # Properly mapped from original parameter order
-                            'reranking': 'completed'
-                        }
-                    }
-                    
-                    analysis.status = 'completed'
-                    analysis.results = results_data
-                    analysis.rerank = reordered_findings
-                    db_session.commit()
-                    logger.info(f"Successfully reranked findings and updated analysis {analysis.id}")
-                except json.JSONDecodeError as je:
-                    logger.error(f"Failed to parse reranking JSON response: {str(je)}")
-                    # Fall back to original order
-                    handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
+            # Explicit type checking and conversion to ensure valid JSON
+            if isinstance(reordered_findings, list):
+                analysis.rerank = reordered_findings
             else:
-                logger.error(f"LLM reranking failed: {response.status_code} - {response_text}")
-                # Fall back to original order
-                handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
+                logger.error(f"Invalid reranked findings type: {type(reordered_findings)}")
+                analysis.rerank = findings  # Fallback to original findings
                 
-        except Exception as e:
-            logger.error(f"Error calling LLM service: {str(e)}")
+            # Log what we're storing in the rerank field
+            logger.info(f"Storing {len(reordered_findings)} findings in rerank column")
+            
+            # Commit with explicit error checking
+            db_session.commit()
+            logger.info(f"Successfully committed reranked findings to database for analysis {analysis.id}")
+            
+            # Verify the data was saved
+            db_session.refresh(analysis)
+            if analysis.rerank:
+                logger.info(f"Verification: rerank column contains {len(analysis.rerank)} items")
+            else:
+                logger.error("Verification failed: rerank column is empty after save")
+        except Exception as db_e:
+            logger.error(f"Database error when saving reranked findings: {str(db_e)}")
             logger.error(traceback.format_exc())
-            # Fall back to original order
-            handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
+            db_session.rollback()
+            
+            # Try one more time with simpler data structure
+            try:
+                analysis.status = 'completed'
+                analysis.results = results_data
+                analysis.rerank = [{'ID': idx+1, 'severity': f.get('severity', 'UNKNOWN')} for idx, f in enumerate(findings)]
+                db_session.commit()
+                logger.info("Successfully saved simplified reranked findings after initial failure")
+            except Exception as retry_e:
+                logger.error(f"Second attempt to save reranked findings failed: {str(retry_e)}")
+                db_session.rollback()
     
     except Exception as e:
         logger.error(f"Error in rerank_findings: {str(e)}")
         logger.error(traceback.format_exc())
         try:
             # Fall back to original order
-            handle_reranking_failure(findings, gitlab_user_id, project_url, user_id, analysis, db_session)
+            analysis.status = 'completed'
+            analysis.results = {
+                'findings': findings,
+                'summary': {
+                    'total_findings': len(findings)
+                },
+                'metadata': {
+                    'timestamp': datetime.utcnow().isoformat(),
+                    'error': str(e)
+                }
+            }
+            analysis.rerank = findings  # Ensure this is not None
+            db_session.commit()
+            logger.info(f"Saved original findings as fallback after error: {analysis.id}")
         except:
             db_session.rollback()
             logger.error("Critical failure in reranking fallback handler")
@@ -897,7 +908,7 @@ def get_analysis_findings(project_id: str):
 
 @gitlab_bp.route('/projects/<project_id>/analysis/reranked', methods=['GET'])
 def get_reranked_findings(project_id: str):
-    """Get reranked findings for a GitLab project"""
+    """Get reranked findings for a GitLab project with improved error handling and debugging"""
     try:
         # Create engine using the function
         engine = create_api_engine()
@@ -931,16 +942,48 @@ def get_reranked_findings(project_id: str):
                     }
                 }), 404
 
-            if not result.rerank:
-                return jsonify({
-                    'success': False,
-                    'error': {
-                        'message': 'No reranked results available',
-                        'code': 'NO_RERANK_RESULTS'
-                    }
-                }), 404
+            # Log detailed information about what we found
+            logger.info(f"Found analysis record with ID: {result.id}, status: {result.status}")
+            
+            # Check for rerank field with better logging
+            has_rerank = result.rerank is not None
+            logger.info(f"Rerank field exists: {has_rerank}")
+            
+            if has_rerank:
+                is_empty = len(result.rerank) == 0 if isinstance(result.rerank, list) else True
+                logger.info(f"Rerank data is empty: {is_empty}")
+                
+                if is_empty:
+                    # Return both success=true and an empty array instead of an error
+                    return jsonify({
+                        'success': True,
+                        'data': []
+                    })
+            else:
+                # If rerank is None but we have findings in results, use those instead
+                if result.results and 'findings' in result.results:
+                    logger.info(f"Using findings from results as rerank is None")
+                    findings = result.results.get('findings', [])
+                    
+                    if findings:
+                        return jsonify({
+                            'success': True,
+                            'data': findings
+                        })
+                    else:
+                        return jsonify({
+                            'success': True,
+                            'data': []
+                        })
+                else:
+                    # Return empty array instead of error
+                    logger.info("No reranked results and no findings available")
+                    return jsonify({
+                        'success': True,
+                        'data': []
+                    })
 
-            # Return just the reranked findings
+            # Return the reranked findings (which we've confirmed exist)
             return jsonify({
                 'success': True,
                 'data': result.rerank
@@ -951,11 +994,13 @@ def get_reranked_findings(project_id: str):
             
     except Exception as e:
         logger.error(f"Error getting reranked findings: {str(e)}")
+        logger.error(traceback.format_exc())
         return jsonify({
             'success': False,
             'error': {
                 'message': 'Internal server error',
-                'code': 'INTERNAL_ERROR'
+                'code': 'INTERNAL_ERROR',
+                'details': str(e)
             }
         }), 500
 
@@ -1279,3 +1324,243 @@ def trigger_general_repository_scan():
     finally:
         if db_session:
             db_session.close()
+
+
+
+######will be removed
+
+
+@gitlab_bp.route('/debug/analyze-rerank/<analysis_id>', methods=['GET'])
+def analyze_rerank_field(analysis_id):
+    """Debugging endpoint to analyze the rerank field of a specific analysis"""
+    try:
+        if os.getenv('FLASK_ENV') != 'production':  # Only available in non-production
+            # Create database session
+            engine = create_api_engine()
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            
+            try:
+                # Get the analysis record
+                analysis = session.query(GitLabAnalysisResult).get(analysis_id)
+                
+                if not analysis:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Analysis not found'
+                    }), 404
+                
+                # Analyze the rerank field
+                response = {
+                    'success': True,
+                    'analysis_id': analysis.id,
+                    'user_id': analysis.user_id,
+                    'project_id': analysis.project_id,
+                    'status': analysis.status,
+                    'timestamp': analysis.timestamp.isoformat(),
+                    'rerank_info': {
+                        'exists': analysis.rerank is not None,
+                        'type': str(type(analysis.rerank)),
+                        'length': len(analysis.rerank) if isinstance(analysis.rerank, list) else 0,
+                        'sample': analysis.rerank[:2] if isinstance(analysis.rerank, list) and analysis.rerank else None
+                    },
+                    'results_info': {
+                        'exists': analysis.results is not None,
+                        'has_findings': 'findings' in analysis.results if analysis.results else False,
+                        'findings_count': len(analysis.results.get('findings', [])) if analysis.results and 'findings' in analysis.results else 0
+                    }
+                }
+                
+                return jsonify(response)
+            finally:
+                session.close()
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'This endpoint is only available in non-production environments'
+            }), 403
+    except Exception as e:
+        logger.error(f"Error analyzing rerank field: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@gitlab_bp.route('/debug/fix-rerank/<analysis_id>', methods=['POST'])
+def fix_rerank_field(analysis_id):
+    """Debugging endpoint to fix the rerank field of a specific analysis"""
+    try:
+        if os.getenv('FLASK_ENV') != 'production':  # Only available in non-production
+            # Create database session
+            engine = create_api_engine()
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            
+            try:
+                # Get the analysis record
+                analysis = session.query(GitLabAnalysisResult).get(analysis_id)
+                
+                if not analysis:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Analysis not found'
+                    }), 404
+                
+                # Check if the rerank field is null but we have findings
+                if analysis.rerank is None and analysis.results and 'findings' in analysis.results:
+                    # Copy findings from results to rerank
+                    analysis.rerank = analysis.results.get('findings', [])
+                    session.commit()
+                    
+                    return jsonify({
+                        'success': True,
+                        'message': 'Rerank field fixed',
+                        'analysis_id': analysis.id,
+                        'rerank_count': len(analysis.rerank)
+                    })
+                elif not analysis.rerank and isinstance(analysis.rerank, list):
+                    # Empty list case - copy findings from results
+                    if analysis.results and 'findings' in analysis.results:
+                        analysis.rerank = analysis.results.get('findings', [])
+                        session.commit()
+                        
+                        return jsonify({
+                            'success': True,
+                            'message': 'Rerank field fixed (was empty list)',
+                            'analysis_id': analysis.id,
+                            'rerank_count': len(analysis.rerank)
+                        })
+                    else:
+                        return jsonify({
+                            'success': False,
+                            'error': 'No findings in results to copy to rerank'
+                        }), 400
+                else:
+                    return jsonify({
+                        'success': False,
+                        'error': 'Rerank field does not need fixing'
+                    }), 400
+            finally:
+                session.close()
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'This endpoint is only available in non-production environments'
+            }), 403
+    except Exception as e:
+        logger.error(f"Error fixing rerank field: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@gitlab_bp.route('/debug/list-analyses/<user_id>', methods=['GET'])
+def list_user_analyses(user_id):
+    """Debugging endpoint to list all analyses for a user"""
+    try:
+        if os.getenv('FLASK_ENV') != 'production':  # Only available in non-production
+            # Create database session
+            engine = create_api_engine()
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            
+            try:
+                # Get all analyses for this user
+                analyses = session.query(GitLabAnalysisResult).filter(
+                    GitLabAnalysisResult.user_id == user_id
+                ).order_by(desc(GitLabAnalysisResult.timestamp)).all()
+                
+                response = {
+                    'success': True,
+                    'user_id': user_id,
+                    'analyses': []
+                }
+                
+                for analysis in analyses:
+                    has_rerank = analysis.rerank is not None
+                    rerank_count = len(analysis.rerank) if has_rerank and isinstance(analysis.rerank, list) else 0
+                    
+                    response['analyses'].append({
+                        'id': analysis.id,
+                        'timestamp': analysis.timestamp.isoformat(),
+                        'status': analysis.status,
+                        'has_rerank': has_rerank,
+                        'rerank_count': rerank_count,
+                        'has_results': analysis.results is not None,
+                        'findings_count': len(analysis.results.get('findings', [])) if analysis.results else 0
+                    })
+                
+                return jsonify(response)
+            finally:
+                session.close()
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'This endpoint is only available in non-production environments'
+            }), 403
+    except Exception as e:
+        logger.error(f"Error listing analyses: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500
+
+@gitlab_bp.route('/debug/fix-all-analyses/<user_id>', methods=['POST'])
+def fix_all_analyses(user_id):
+    """Debugging endpoint to fix the rerank field for all analyses of a user"""
+    try:
+        if os.getenv('FLASK_ENV') != 'production':  # Only available in non-production
+            # Create database session
+            engine = create_api_engine()
+            Session = sessionmaker(bind=engine)
+            session = Session()
+            
+            try:
+                # Get all analyses for this user
+                analyses = session.query(GitLabAnalysisResult).filter(
+                    GitLabAnalysisResult.user_id == user_id,
+                    GitLabAnalysisResult.status == 'completed'
+                ).all()
+                
+                fixed_count = 0
+                already_ok_count = 0
+                no_findings_count = 0
+                
+                for analysis in analyses:
+                    if analysis.rerank is None and analysis.results and 'findings' in analysis.results:
+                        # Copy findings from results to rerank
+                        analysis.rerank = analysis.results.get('findings', [])
+                        fixed_count += 1
+                    elif not analysis.rerank and isinstance(analysis.rerank, list) and analysis.results and 'findings' in analysis.results:
+                        # Empty list case
+                        analysis.rerank = analysis.results.get('findings', [])
+                        fixed_count += 1
+                    elif analysis.rerank:
+                        already_ok_count += 1
+                    else:
+                        no_findings_count += 1
+                
+                # Commit all changes
+                session.commit()
+                
+                return jsonify({
+                    'success': True,
+                    'user_id': user_id,
+                    'total_analyses': len(analyses),
+                    'fixed_count': fixed_count,
+                    'already_ok_count': already_ok_count,
+                    'no_findings_count': no_findings_count
+                })
+            finally:
+                session.close()
+        else:
+            return jsonify({
+                'success': False,
+                'error': 'This endpoint is only available in non-production environments'
+            }), 403
+    except Exception as e:
+        logger.error(f"Error fixing all analyses: {str(e)}")
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        }), 500

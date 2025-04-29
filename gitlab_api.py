@@ -252,12 +252,13 @@ def trigger_specific_repository_scan(repo_id):
 
         # Create initial analysis record
         analysis = GitLabAnalysisResult(
-            project_id=str(repo_id),
+            user_id=str(repo_id),  
             project_url=project_url,
-            user_id=user_id,
+            gitlab_user_id=user_id, 
             status='queued',
             timestamp=datetime.utcnow()
         )
+
         db_session.add(analysis)
         db_session.commit()
         logger.info(f"Created analysis record with ID: {analysis.id}")
@@ -379,9 +380,9 @@ def handle_reranking_failure(findings, project_id, project_url, user_id, analysi
         'metadata': {
             'scan_duration_seconds': 0,
             'timestamp': datetime.utcnow().isoformat(),
-            'project_id': project_id,
+            'user_id': project_id,  
             'project_url': project_url,
-            'user_id': user_id,
+            'gitlab_user_id': user_id,  
             'reranking': 'failed_used_original'
         }
     }
@@ -421,7 +422,7 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
             'metadata': {
                 'repository': project_url.split('gitlab.com/')[-1],
                 'project_url': project_url,
-                'user_id': user_id,
+                'gitlab_user_id': user_id,
                 'timestamp': datetime.utcnow().isoformat(),
                 'scan_id': analysis.id if analysis else None
             }
@@ -464,9 +465,9 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
                 'metadata': {
                     'scan_duration_seconds': 0,  # We don't have this info here
                     'timestamp': datetime.utcnow().isoformat(),
-                    'project_id': project_id,
+                    'user_id': project_id,
                     'project_url': project_url,
-                    'user_id': user_id,
+                    'gitlab_user_id': user_id,
                     'reranking': 'skipped_no_url'
                 }
             }
@@ -549,9 +550,9 @@ def rerank_findings(findings, user_id, project_url, project_id, analysis, db_ses
                         'metadata': {
                             'scan_duration_seconds': 0,  # We don't have this info here
                             'timestamp': datetime.utcnow().isoformat(),
-                            'project_id': project_id,
+                            'user_id': project_id,
                             'project_url': project_url,
-                            'user_id': user_id,
+                            'gitlab_user_id': user_id,
                             'reranking': 'completed'
                         }
                     }
@@ -796,12 +797,12 @@ def get_analysis_findings(project_id: str):
         try:
             # Build query
             query = db_session.query(GitLabAnalysisResult).filter_by(
-                project_id=project_id
+                user_id=project_id 
             )
             
             # Add user_id filter if provided
             if user_id:
-                query = query.filter_by(user_id=user_id)
+                query = query.filter_by(gitlab_user_id=user_id)
                 
             # Get latest analysis result
             result = query.order_by(
@@ -908,12 +909,12 @@ def get_reranked_findings(project_id: str):
             
             # Build query
             query = session.query(GitLabAnalysisResult).filter_by(
-                project_id=project_id
+                user_id=project_id
             )
             
             # Add user_id filter if provided
             if user_id:
-                query = query.filter_by(user_id=user_id)
+                query = query.filter_by(gitlab_user_id=user_id)
             
             # Get latest analysis result
             result = query.order_by(
@@ -968,7 +969,7 @@ def get_top_vulnerabilities(user_id):
 
         try:
             analyses = session.query(GitLabAnalysisResult).filter(
-                GitLabAnalysisResult.user_id == user_id,
+                GitLabAnalysisResult.gitlab_user_id == user_id,
                 GitLabAnalysisResult.status == 'completed',
                 GitLabAnalysisResult.results.isnot(None)
             ).order_by(GitLabAnalysisResult.timestamp.desc()).all()
@@ -1183,11 +1184,12 @@ def trigger_general_repository_scan():
 
         # Create analysis record
         analysis = GitLabAnalysisResult(
-            project_id=project_id,
+            user_id=project_id, 
             project_url=project_url,
-            user_id=user_id,
+            gitlab_user_id=user_id,  
             status='queued'
         )
+
         db_session.add(analysis)
         db_session.commit()
         logger.info(f"Created analysis record with ID: {analysis.id}")

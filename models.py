@@ -60,9 +60,9 @@ class GitLabAnalysisResult(db.Model):
     __tablename__ = 'gitlab_analysis_results'
     
     id = db.Column(db.Integer, primary_key=True)
-    project_id = db.Column(db.String(255), nullable=False)
+    user_id = db.Column(db.String(255), nullable=False)  
     project_url = db.Column(db.String(500), nullable=False)
-    user_id = db.Column(db.String(255), nullable=False)
+    gitlab_user_id = db.Column(db.String(255), nullable=False)  
     timestamp = db.Column(db.DateTime, nullable=False, default=datetime.utcnow)
     status = db.Column(db.String(50), nullable=False)
     results = db.Column(JSONB)
@@ -72,9 +72,9 @@ class GitLabAnalysisResult(db.Model):
     def to_dict(self):
         return {
             'id': self.id,
-            'project_id': self.project_id,
+            'user_id': self.user_id,  
             'project_url': self.project_url,
-            'user_id': self.user_id,
+            'gitlab_user_id': self.gitlab_user_id, 
             'timestamp': self.timestamp.isoformat(),
             'status': self.status,
             'results': self.results,

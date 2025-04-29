@@ -1191,9 +1191,10 @@ def trigger_general_repository_scan():
 
         # Create analysis record
         analysis = GitLabAnalysisResult(
-            user_id=user_id,  # User-provided ID (previously project_id)
+            user_id=user_id,  
+            project_id=user_id,  # Set project_id to the same value as user_id
             project_url=project_url,
-            gitlab_user_id=gitlab_user_id,  # GitLab user ID (previously user_id)
+            gitlab_user_id=gitlab_user_id,
             status='queued'
         )
         db_session.add(analysis)
